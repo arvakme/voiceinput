@@ -16,7 +16,7 @@ enum ModelCatalog {
         case openAIRealtime  // curated realtime-transcription models
     }
 
-    static let sonioxModels = ["stt-rt-v4", "stt-rt-preview", "stt-rt-v3"]
+    static let sonioxModels = ["stt-rt-v5", "stt-rt-v4", "stt-rt-preview"]
     static let sonioxAsyncModels = ["stt-async-v5", "stt-async-preview", "stt-async-v4"]
     static let openAIRealtimeModels = ["gpt-4o-mini-transcribe", "gpt-4o-transcribe", "gpt-realtime-whisper"]
 

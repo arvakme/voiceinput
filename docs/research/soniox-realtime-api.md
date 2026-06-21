@@ -31,7 +31,8 @@ Flow: open the WebSocket → send **one JSON text frame** (the config) as the fi
 
 Field notes:
 - `api_key` (required) — supports regular keys and temporary API keys.
-- `model` (required) — **current GA realtime model is `stt-rt-v4`** (released 2026-02-05, production-ready). `stt-rt-v3` / `stt-rt-preview` are aliases auto-routed to v4 since 2026-02-28. Use `stt-rt-v4`.
+- `model` (required) — **current GA realtime model is `stt-rt-v5`** (released 2026-06-16; major gains in noisy/telephone/multi-speaker/accented/overlapping/language-switching accuracy AND translation quality). Fully API-compatible with v4 — drop-in, just change the model name. **`stt-rt-v4` retires 2026-06-30** and auto-routes to v5 after. Async equivalent: `stt-async-v5`.
+- Real-time translation (unchanged from v4): `translation: {type:"one_way", target_language:"zh"}` or `{type:"two_way", language_a:"en", language_b:"zh"}`; tokens tagged `translation_status` = `"original"` / `"translation"`. v5 adds optional `context.translation_terms` (array of `{source, target}`) for custom translation vocabulary.
 - `audio_format` (required) — `"auto"` for containerized formats, or raw: `pcm_s16le` etc. **Raw formats require `sample_rate` and `num_channels`.** Use `"pcm_s16le"`, `16000`, `1`.
 - `max_endpoint_delay_ms` — allowed 500–3000, default 2000.
 - `translation` — one-way: `{"type": "one_way", "target_language": "es"}`; two-way: `{"type": "two_way", "language_a": "en", "language_b": "es"}`.

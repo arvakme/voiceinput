@@ -195,7 +195,10 @@ final class AppSettings: ObservableObject {
         if d.object(forKey: Key.sonioxAsyncModel) == nil      { d.set("stt-async-v5", forKey: Key.sonioxAsyncModel) }
         if d.object(forKey: Key.openAIRealtimeModel) == nil   { d.set("gpt-4o-mini-transcribe", forKey: Key.openAIRealtimeModel) }
         if d.object(forKey: Key.sonioxAPIKey) == nil          { d.set("", forKey: Key.sonioxAPIKey) }
-        if d.object(forKey: Key.sonioxModel) == nil           { d.set("stt-rt-v4", forKey: Key.sonioxModel) }
+        if d.object(forKey: Key.sonioxModel) == nil           { d.set("stt-rt-v5", forKey: Key.sonioxModel) }
+        // v5 (GA 2026-06-16) replaces v4 — better accuracy + translation, same
+        // API. v4 retires 2026-06-30. Move anyone still on the v4 default up.
+        if d.string(forKey: Key.sonioxModel) == "stt-rt-v4"   { d.set("stt-rt-v5", forKey: Key.sonioxModel) }
         if d.object(forKey: Key.httpASRBaseURL) == nil        { d.set("https://api.openai.com/v1", forKey: Key.httpASRBaseURL) }
         if d.object(forKey: Key.httpASRAPIKey) == nil         { d.set("", forKey: Key.httpASRAPIKey) }
         if d.object(forKey: Key.httpASRModel) == nil          { d.set("gpt-4o-mini-transcribe", forKey: Key.httpASRModel) }
@@ -327,8 +330,8 @@ final class AppSettings: ObservableObject {
     }
 
     @Published var sonioxModel: String = {
-        let v = UserDefaults.standard.string(forKey: Key.sonioxModel) ?? "stt-rt-v4"
-        return v.isEmpty ? "stt-rt-v4" : v
+        let v = UserDefaults.standard.string(forKey: Key.sonioxModel) ?? "stt-rt-v5"
+        return v.isEmpty ? "stt-rt-v5" : v
     }() {
         didSet { defaults.set(sonioxModel, forKey: Key.sonioxModel) }
     }
