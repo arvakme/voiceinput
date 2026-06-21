@@ -415,9 +415,17 @@ private struct ListenPulseDot: View {
                 Circle().stroke(Theme.accent, lineWidth: 2)
                     .scaleEffect(pulse ? 2.1 : 1).opacity(pulse ? 0 : 0.6)
             )
-            .onAppear {
-                withAnimation(.easeOut(duration: 1.1).repeatForever(autoreverses: false)) { pulse = true }
-            }
+            // Only run the forever-repeating pulse while capture is live;
+            // otherwise the animation keeps compositing behind a hidden panel.
+            .animation(
+                (active || connecting)
+                    ? .easeOut(duration: 1.1).repeatForever(autoreverses: false)
+                    : .default,
+                value: pulse
+            )
+            .onAppear { pulse = (active || connecting) }
+            .onChange(of: active) { _, _ in pulse = (active || connecting) }
+            .onChange(of: connecting) { _, _ in pulse = (active || connecting) }
     }
 }
 

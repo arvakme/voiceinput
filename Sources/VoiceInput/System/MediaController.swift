@@ -1,5 +1,4 @@
 import AppKit
-import CoreAudio
 import Foundation
 
 // CoreServices / AE framework — used for TCC automation-permission probe.
@@ -14,15 +13,18 @@ import ApplicationServices
 /// Strategy (in priority order):
 /// 1. Spotify — AppleScript "tell application "Spotify" to pause/play"
 /// 2. Apple Music — AppleScript "tell application "Music" to pause/play"
-/// 3. System-wide fallback — detect output audio via CoreAudio
-///    (kAudioDevicePropertyDeviceIsRunningSomewhere on the default output
-///    device) and send a Play/Pause media key event (NX_KEYTYPE_PLAY subtype 8
-///    via NSEvent.otherEvent + CGEvent post). Resumed only if we sent the
-///    key-down to pause.
+///
+/// There is deliberately NO generic fallback. The previous CoreAudio +
+/// system-Play/Pause-media-key path was removed: the only available signal
+/// (`kAudioDevicePropertyDeviceIsRunningSomewhere`) is true whenever ANY app
+/// merely holds the output device open (browsers, Discord, etc., even while
+/// silent), so it false-positived constantly. When it fired with nothing
+/// actually playing, macOS routed the media key to its default handler and
+/// LAUNCHED Apple Music. Only the two apps we can query precisely (Spotify,
+/// Music) are paused; nothing can be launched.
 ///
 /// MRMediaRemote is NOT used — `MRMediaRemoteSendCommand` has been ineffective
-/// for unsigned third-party apps since macOS 15.4 and adds no value now that
-/// we have a CoreAudio + media-key path.
+/// for unsigned third-party apps since macOS 15.4.
 ///
 /// TCC / automation consent: `.accessory` (no-Dock) apps do not bring
 /// themselves to front when NSAppleScript runs, so the TCC consent dialog can
@@ -43,7 +45,6 @@ final class MediaController {
     private enum Strategy {
         case spotify
         case music
-        case mediaKey   // CoreAudio detected audio → sent play/pause key
     }
     private var strategy: Strategy?
 
@@ -113,17 +114,8 @@ final class MediaController {
             Log.app.info("MediaController: Apple Music not running")
         }
 
-        // --- System-wide fallback via CoreAudio + media key ---
-        // Only attempt if the default output device currently has audio running
-        // (covers browsers, IINA, NetEase, QQ Music, etc.).
-        if outputDeviceIsPlaying() {
-            Log.app.info("MediaController: output audio detected — sending Play/Pause media key")
-            sendMediaKeyPlayPause()
-            strategy = .mediaKey
-            didPauseMedia = true
-        } else {
-            Log.app.info("MediaController: no output audio detected — nothing to pause")
-        }
+        // No generic fallback by design — see the type doc comment.
+        Log.app.info("MediaController: no Spotify/Music playback to pause")
     }
 
     /// Resumes only the source we actually paused.
@@ -147,10 +139,6 @@ final class MediaController {
         case .music:
             _ = runSimple("tell application \"Music\" to play")
             Log.app.info("MediaController: resumed Music via AppleScript")
-        case .mediaKey:
-            // Send the toggle key again — it will resume whatever we paused.
-            sendMediaKeyPlayPause()
-            Log.app.info("MediaController: resumed via Play/Pause media key")
         }
     }
 
@@ -245,114 +233,5 @@ final class MediaController {
             return false
         }
         return true
-    }
-
-    // MARK: - CoreAudio output-device detection
-
-    /// Returns true if the default system output device is currently running
-    /// audio (i.e. some process is outputting to it).
-    ///
-    /// `kAudioDevicePropertyDeviceIsRunningSomewhere` ('gone') is a read-only
-    /// UInt32 property that is 1 when any client is using the device and 0
-    /// otherwise. It does NOT distinguish between our own mic-capture sessions
-    /// (input device) and third-party playback — but our AVAudioEngine tap is
-    /// on the INPUT device, not the output device, so any "running" signal on
-    /// the OUTPUT device reliably means something external is playing audio.
-    private func outputDeviceIsPlaying() -> Bool {
-        // 1. Get the default output device ID.
-        var defaultOutputID = AudioDeviceID(kAudioObjectUnknown)
-        var propSize = UInt32(MemoryLayout<AudioDeviceID>.size)
-        var propAddr = AudioObjectPropertyAddress(
-            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain
-        )
-
-        let getDevErr = AudioObjectGetPropertyData(
-            AudioObjectID(kAudioObjectSystemObject),
-            &propAddr,
-            0, nil,
-            &propSize,
-            &defaultOutputID
-        )
-        guard getDevErr == noErr, defaultOutputID != kAudioObjectUnknown else {
-            Log.app.warning("MediaController: could not get default output device: \(getDevErr)")
-            return false
-        }
-        Log.app.info("MediaController: default output device ID = \(defaultOutputID)")
-
-        // 2. Query kAudioDevicePropertyDeviceIsRunningSomewhere on it.
-        var isRunning = UInt32(0)
-        propSize = UInt32(MemoryLayout<UInt32>.size)
-        propAddr = AudioObjectPropertyAddress(
-            mSelector: kAudioDevicePropertyDeviceIsRunningSomewhere,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain
-        )
-
-        let runErr = AudioObjectGetPropertyData(
-            defaultOutputID,
-            &propAddr,
-            0, nil,
-            &propSize,
-            &isRunning
-        )
-        guard runErr == noErr else {
-            Log.app.warning("MediaController: IsRunningSomewhere query failed: \(runErr)")
-            return false
-        }
-
-        Log.app.info("MediaController: output device IsRunningSomewhere = \(isRunning)")
-        return isRunning != 0
-    }
-
-    // MARK: - Media key (Play/Pause) event
-
-    /// Posts a synthetic Play/Pause key-down + key-up via NSEvent / CGEvent.
-    ///
-    /// This is the standard technique for controlling the system's Now Playing
-    /// app from any process: NSEvent.otherEvent(type: .systemDefined,
-    /// location:, modifierFlags:, timestamp:, windowNumber:, context:,
-    /// subtype: 8, data1: (NX_KEYTYPE_PLAY << 16) | (0 << 8),
-    /// data2: -1) posted to CGEvent stream.
-    ///
-    /// subtype 8 == NX_SUBTYPE_AUX_CONTROL_BUTTONS
-    /// NX_KEYTYPE_PLAY == 16 (from <IOKit/hidsystem/ev_keymap.h>)
-    /// data1 bit layout: [31:16] key code, [15:8] key modifier, [7] key-down flag
-    private func sendMediaKeyPlayPause() {
-        let NX_KEYTYPE_PLAY: Int32 = 16
-        let keyDown = NSEvent.otherEvent(
-            with: .systemDefined,
-            location: .zero,
-            modifierFlags: .init(rawValue: 0xa00),
-            timestamp: ProcessInfo.processInfo.systemUptime,
-            windowNumber: 0,
-            context: nil,
-            subtype: 8,
-            data1: Int((NX_KEYTYPE_PLAY << 16) | (0xa << 8) | (1 << 7)),
-            data2: -1
-        )
-        let keyUp = NSEvent.otherEvent(
-            with: .systemDefined,
-            location: .zero,
-            modifierFlags: .init(rawValue: 0xa00),
-            timestamp: ProcessInfo.processInfo.systemUptime,
-            windowNumber: 0,
-            context: nil,
-            subtype: 8,
-            data1: Int((NX_KEYTYPE_PLAY << 16) | (0xa << 8) | (0 << 7)),
-            data2: -1
-        )
-
-        if let downEvent = keyDown?.cgEvent, let upEvent = keyUp?.cgEvent {
-            downEvent.post(tap: .cghidEventTap)
-            upEvent.post(tap: .cghidEventTap)
-            Log.app.info("MediaController: posted Play/Pause key-down + key-up via CGEvent")
-        } else {
-            Log.app.warning("MediaController: failed to create Play/Pause CGEvent — falling back to NSEvent post")
-            // Fallback: post via NSEvent directly (slightly less reliable but worth trying)
-            keyDown.map { NSApp.sendEvent($0) }
-            keyUp.map  { NSApp.sendEvent($0) }
-        }
     }
 }

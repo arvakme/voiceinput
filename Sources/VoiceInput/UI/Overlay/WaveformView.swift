@@ -57,12 +57,33 @@ struct WaveformView: View {
         self.height = height
     }
 
+    /// Only the audio-active phases drive the per-frame render clock. When the
+    /// box is idle/dismissed (or merely refining/injecting, where no audio
+    /// flows), `TimelineView(.animation)` is torn down so the `Canvas` stops
+    /// repainting at the display refresh rate — otherwise the always-mounted
+    /// box would burn CPU forever behind a hidden panel.
+    private var isLive: Bool {
+        switch state.phase {
+        case .connecting, .listening, .finalizing: return true
+        case .idle, .refining, .injecting, .error: return false
+        }
+    }
+
     var body: some View {
-        TimelineView(.animation) { timeline in
-            Canvas { context, size in
-                draw(in: &context,
-                     size: size,
-                     now: timeline.date.timeIntervalSinceReferenceDate)
+        Group {
+            if isLive {
+                TimelineView(.animation) { timeline in
+                    Canvas { context, size in
+                        draw(in: &context,
+                             size: size,
+                             now: timeline.date.timeIntervalSinceReferenceDate)
+                    }
+                }
+            } else {
+                // A single static frame of the current ring — no clock, no churn.
+                Canvas { context, size in
+                    draw(in: &context, size: size, now: 0)
+                }
             }
         }
         .frame(height: height)
