@@ -27,24 +27,25 @@ final class TextInjector {
         pasteboard.setString(text, forType: .string)
 
         // If a non-ASCII input source (e.g. Chinese IME) is active, temporarily
-        // switch to an ASCII-capable one so Cmd-V is not intercepted by the IME.
+        // switch to an ASCII keyboard layout so Cmd-V is not intercepted by
+        // the IME — but ONLY if such a layout actually exists. On layouts-free
+        // setups (Squirrel-only) we deliberately don't switch: IMEs pass
+        // command-modified keys through, so Cmd-V pastes fine anyway.
         let originalSource = TISCopyCurrentKeyboardInputSource().takeRetainedValue()
-        let needSwitch = !isASCIICapable(originalSource)
+        let asciiSource = isASCIICapable(originalSource) ? nil : findASCIICapableSource()
 
-        if needSwitch {
-            if let asciiSource = findASCIICapableSource() {
-                TISSelectInputSource(asciiSource)
-                usleep(50_000) // 50 ms for system to settle
-            }
+        if let asciiSource {
+            TISSelectInputSource(asciiSource)
+            usleep(50_000) // 50 ms for system to settle
         }
 
         // Synthesise Cmd+V (requires Accessibility permission).
         postCommandKey(0x09)
 
-        Log.keys.info("TextInjector: injected \(text.count) chars needSwitch=\(needSwitch)")
+        Log.keys.info("TextInjector: injected \(text.count) chars switchedLayout=\(asciiSource != nil)")
 
         // Restore input source after paste.
-        if needSwitch {
+        if asciiSource != nil {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
                 TISSelectInputSource(originalSource)
             }
@@ -110,10 +111,18 @@ final class TextInjector {
         return CFBooleanGetValue(value)
     }
 
+    /// A real, user-selectable ASCII keyboard LAYOUT (ABC/US preferred), or
+    /// nil when the user has none enabled. The type + select-capable filters
+    /// are load-bearing: the plain ASCII-capable+enabled list can lead with
+    /// palette pseudo-sources (com.apple.CharacterPaletteIM — the system
+    /// emoji picker), and TISSelectInputSource on one of those OPENS that
+    /// palette as a floating window.
     private func findASCIICapableSource() -> TISInputSource? {
         let criteria = [
+            kTISPropertyInputSourceType: kTISTypeKeyboardLayout as Any,
             kTISPropertyInputSourceIsASCIICapable: true,
-            kTISPropertyInputSourceIsEnabled: true
+            kTISPropertyInputSourceIsEnabled: true,
+            kTISPropertyInputSourceIsSelectCapable: true
         ] as CFDictionary
         guard let sourceList = TISCreateInputSourceList(criteria, false)?
             .takeRetainedValue() as? [TISInputSource]
