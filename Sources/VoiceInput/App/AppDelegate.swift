@@ -88,6 +88,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Set initial hotkey label on the overlay.
         dictationController.updateHotkeyLabel(settings.hotkeyDisplayName)
 
+        // Refresh the Rime vocabulary import a couple seconds after launch —
+        // late enough that Squirrel's own sync isn't racing our own startup.
+        if settings.rimeImportEnabled {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                VocabularyStore.shared.refreshFromRime()
+            }
+        }
+
         // Listen for preview-overlay notification from the Appearance settings tab.
         NotificationCenter.default.addObserver(
             self,

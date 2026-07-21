@@ -2,6 +2,13 @@ import AVFoundation
 import Foundation
 import os.log
 
+/// Single source of truth for the realtime model fallback used whenever a
+/// per-field default is empty — config frames here and in `SonioxListenSession`,
+/// plus Settings UI placeholders/labels. `stt-rt-v4` retired 2026-06-30.
+enum SonioxDefaults {
+    static let realtimeModel = "stt-rt-v5"
+}
+
 /// Soniox real-time transcription over a WebSocket.
 ///
 /// Protocol summary (from docs/research/soniox-realtime-api.md):
@@ -35,6 +42,9 @@ final class SonioxRealtimeSession: TranscriptionSession {
     private static let websocketURL = URL(string: "wss://stt-rt.soniox.com/transcribe-websocket")!
     private static let keepaliveInterval: TimeInterval = 8
     private static let finalizeTimeoutInterval: TimeInterval = 3
+    /// Soniox allows 500–3000 (default 2000); lower = snappier hands-free stop,
+    /// safe for dictation since finals are append-only regardless of when it fires.
+    private static let maxEndpointDelayMs = 1000
 
     // MARK: - Private state
 
@@ -173,12 +183,13 @@ final class SonioxRealtimeSession: TranscriptionSession {
 
         var config: [String: Any] = [
             "api_key": apiKey.isEmpty ? "" : apiKey,
-            "model": model.isEmpty ? "stt-rt-v4" : model,
+            "model": model.isEmpty ? SonioxDefaults.realtimeModel : model,
             "audio_format": "pcm_s16le",
             "sample_rate": 16000,
             "num_channels": 1,
             "enable_language_identification": true,
             "enable_endpoint_detection": true,
+            "max_endpoint_delay_ms": SonioxRealtimeSession.maxEndpointDelayMs,
         ]
 
         if !langHints.isEmpty {
@@ -433,8 +444,12 @@ final class SonioxRealtimeSession: TranscriptionSession {
     }
 
     private func buildFinalText() -> String {
-        // Only finals are included in the "committed" result; interims are discarded.
-        let text = accumulatedFinals.joined().trimmingCharacters(in: .whitespacesAndNewlines)
+        // On the normal finished:true path currentInterims is always empty (the
+        // server finalizes everything before sending it), so appending here is a
+        // no-op there and only rescues the last un-finalized utterance on the
+        // timeout/error fallback paths — the transcript is sacred.
+        let text = (accumulatedFinals.joined() + currentInterims.joined())
+            .trimmingCharacters(in: .whitespacesAndNewlines)
         return text
     }
 

@@ -123,6 +123,13 @@ final class AudioCapture {
             isTapInstalled = false
         }
         converter = nil
+
+        // Flush the <100 ms remainder that never reached a full chunk boundary —
+        // otherwise the tail of speech right before stop is silently dropped.
+        if !sampleAccumulator.isEmpty {
+            onChunk?(sampleAccumulator)
+            sampleAccumulator = Data()
+        }
     }
 
     // MARK: - Audio processing

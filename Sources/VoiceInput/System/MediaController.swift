@@ -26,8 +26,15 @@ import ApplicationServices
 /// MRMediaRemote is NOT used — `MRMediaRemoteSendCommand` has been ineffective
 /// for unsigned third-party apps since macOS 15.4.
 ///
+/// All AppleScript I/O runs as `/usr/bin/osascript` subprocesses on a private
+/// serial queue — never on the caller's thread. `pauseIfPlaying`/
+/// `resumeIfPaused` enqueue and return immediately (call-and-forget); the
+/// queue being serial guarantees a `resumeIfPaused` enqueued right after
+/// `pauseIfPlaying` runs only once the pause has actually completed and its
+/// state (`didPauseMedia`/`strategy`) is settled.
+///
 /// TCC / automation consent: `.accessory` (no-Dock) apps do not bring
-/// themselves to front when NSAppleScript runs, so the TCC consent dialog can
+/// themselves to front when an AppleScript runs, so the TCC consent dialog can
 /// be silently blocked behind other windows. Before a first Spotify/Music
 /// AppleScript call we probe `AEDeterminePermissionToAutomateTarget` with
 /// `askUserIfNeeded: false`; if the status indicates consent has NOT been
@@ -38,9 +45,9 @@ import ApplicationServices
 /// INSIDE these methods so callers stay unconditional.
 final class MediaController {
 
-    // MARK: - State
+    // MARK: - State (confined to `queue` — see below)
 
-    private(set) var didPauseMedia = false
+    private var didPauseMedia = false
 
     private enum Strategy {
         case spotify
@@ -48,18 +55,44 @@ final class MediaController {
     }
     private var strategy: Strategy?
 
+    /// Serializes all AppleScript subprocess launches. `waitUntilExit` runs
+    /// here, which is fine — this is never the main thread.
+    private let queue = DispatchQueue(label: "com.zhijie.VoiceInput.MediaController")
+
     // MARK: - Init / deinit
 
     init() {}
 
     // MARK: - Public API
 
-    /// Pauses media if something is playing.
+    /// Pauses media if something is playing. Enqueues the work and returns
+    /// immediately; does not block the caller.
     ///
     /// Guards `AppSettings.shared.mediaAutoPause` first. Only the strategy that
     /// actually succeeds sets `didPauseMedia = true`, so `resumeIfPaused()` only
     /// undoes what we did.
     func pauseIfPlaying() {
+        queue.async { [weak self] in
+            self?.pauseIfPlayingOnQueue()
+        }
+    }
+
+    /// Resumes only the source we actually paused. Enqueues the work and
+    /// returns immediately.
+    ///
+    /// Deliberately does NOT re-check `AppSettings.shared.mediaAutoPause`: the
+    /// gate lives in `pauseIfPlaying`, and whatever we actually paused must
+    /// always be resumed even if the user toggles the setting off mid-session.
+    /// Otherwise their media would stay paused forever.
+    func resumeIfPaused() {
+        queue.async { [weak self] in
+            self?.resumeIfPausedOnQueue()
+        }
+    }
+
+    // MARK: - Queue-confined implementation
+
+    private func pauseIfPlayingOnQueue() {
         didPauseMedia = false
         strategy = nil
 
@@ -118,13 +151,7 @@ final class MediaController {
         Log.app.info("MediaController: no Spotify/Music playback to pause")
     }
 
-    /// Resumes only the source we actually paused.
-    ///
-    /// Deliberately does NOT re-check `AppSettings.shared.mediaAutoPause`: the
-    /// gate lives in `pauseIfPlaying`, and whatever we actually paused must
-    /// always be resumed even if the user toggles the setting off mid-session.
-    /// Otherwise their media would stay paused forever.
-    func resumeIfPaused() {
+    private func resumeIfPausedOnQueue() {
         guard didPauseMedia, let strategy else {
             Log.app.info("MediaController: resumeIfPaused called but nothing was paused — no-op")
             return
@@ -188,7 +215,11 @@ final class MediaController {
             Log.app.info("MediaController: automation consent already granted for \(bundleID)")
         case OSStatus(-1744): // errAEEventWouldRequireUserConsent
             Log.app.info("MediaController: consent not yet determined for \(bundleID) — activating app so TCC dialog is visible")
-            NSApp.activate(ignoringOtherApps: true)
+            // NSApp.activate touches AppKit — hop back to main rather than
+            // calling it from this background queue.
+            DispatchQueue.main.async {
+                NSApp.activate(ignoringOtherApps: true)
+            }
         case OSStatus(-1743): // errAEEventNotPermitted
             Log.app.warning("MediaController: automation denied for \(bundleID) — AppleScript will fail")
         case OSStatus(-600): // procNotFound
@@ -198,7 +229,7 @@ final class MediaController {
         }
     }
 
-    // MARK: - AppleScript helpers
+    // MARK: - AppleScript helpers (queue-confined)
 
     private func isAppRunning(_ bundleID: String) -> Bool {
         NSWorkspace.shared.runningApplications.contains { $0.bundleIdentifier == bundleID }
@@ -207,31 +238,45 @@ final class MediaController {
     /// Returns "playing", "paused", "stopped", or nil on script error.
     private func playerState(app: String) -> String? {
         let source = "tell application \"\(app)\" to return player state as string"
-        guard let script = NSAppleScript(source: source) else { return nil }
-        var errorInfo: NSDictionary?
-        let output = script.executeAndReturnError(&errorInfo)
-        if let errorInfo {
-            Log.app.warning("MediaController: \(app) player-state query error: \(errorInfo)")
-            return nil
-        }
-        let state = output.stringValue
-        Log.app.info("MediaController: \(app) player state = \(state ?? "<nil>")")
+        guard let state = runOSAScript(source), !state.isEmpty else { return nil }
+        Log.app.info("MediaController: \(app) player state = \(state)")
         return state
     }
 
     /// Runs a one-liner AppleScript. Returns true on success.
     @discardableResult
     private func runSimple(_ source: String) -> Bool {
-        guard let script = NSAppleScript(source: source) else {
-            Log.app.warning("MediaController: NSAppleScript alloc failed for: \(source)")
-            return false
+        runOSAScript(source) != nil
+    }
+
+    /// Runs `source` via `/usr/bin/osascript -e` and returns trimmed stdout,
+    /// or nil if the process failed to launch or exited non-zero.
+    private func runOSAScript(_ source: String) -> String? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        process.arguments = ["-e", source]
+
+        let outPipe = Pipe()
+        process.standardOutput = outPipe
+        process.standardError = Pipe()
+
+        do {
+            try process.run()
+        } catch {
+            Log.app.warning("MediaController: osascript launch failed: \(error.localizedDescription)")
+            return nil
         }
-        var errorInfo: NSDictionary?
-        _ = script.executeAndReturnError(&errorInfo)
-        if let errorInfo {
-            Log.app.warning("MediaController: AppleScript error: \(errorInfo)")
-            return false
+
+        // Drain stdout to EOF before waitUntilExit: osascript's output here is
+        // a few bytes, but reading first avoids ever blocking on a full pipe
+        // while the child blocks on write.
+        let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+
+        guard process.terminationStatus == 0 else {
+            Log.app.warning("MediaController: osascript exited \(process.terminationStatus)")
+            return nil
         }
-        return true
+        return String(data: outData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }

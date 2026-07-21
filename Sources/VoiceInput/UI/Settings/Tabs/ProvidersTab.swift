@@ -158,7 +158,7 @@ struct ProvidersTab: View {
                         help: "Soniox streaming model (WebSocket)."
                     ) {
                         ModelPickerField(
-                            placeholder: "stt-rt-v4",
+                            placeholder: SonioxDefaults.realtimeModel,
                             model: $settings.sonioxModel,
                             kind: .sonioxRealtime
                         )
@@ -357,7 +357,7 @@ struct ProvidersTab: View {
                 ) {
                     SecureFieldRow(placeholder: "soniox-…", text: $settings.sonioxAPIKey)
                 }
-                Text("Uses the Soniox realtime model from the Voice model page (\(settings.sonioxModel.isEmpty ? "stt-rt-v4" : settings.sonioxModel)).")
+                Text("Uses the Soniox realtime model from the Voice model page (\(settings.sonioxModel.isEmpty ? SonioxDefaults.realtimeModel : settings.sonioxModel)).")
                     .font(.system(size: 12))
                     .foregroundStyle(Theme.textSecondary)
                     .frame(maxWidth: .infinity, alignment: .leading)

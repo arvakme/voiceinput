@@ -36,6 +36,12 @@ final class DictationController {
     private var isActive: Bool = false
     private var bestTranscript: String = ""
 
+    /// The pre-refine best text, set right before `refiner.refine` is called
+    /// and cleared once its completion actually lands (generation-guarded) or
+    /// on explicit cancel. Non-nil here means a refine is in flight for a
+    /// session `beginSession` no longer owns — see the flush at its top.
+    private var pendingBestTranscript: String?
+
     /// Text carried across mid-session engine hot-swaps (mode/provider chip).
     /// Displayed transcript = join(carriedText, current engine's snapshot).
     private var carriedText: String = ""
@@ -110,6 +116,29 @@ final class DictationController {
             Log.app.debug("beginSession ignored — session already active")
             return
         }
+
+        // A refine pipeline from the PREVIOUS session may still be in flight
+        // (slow :free polish models take 10-30 s) — its completion would be
+        // dropped by the generation guard the moment we bump sessionGeneration
+        // below, silently losing the transcript. Flush it now: inject + record
+        // to history using what we have, then let this new session own its
+        // own overlay/media/KeyMonitor sequencing from scratch.
+        if let flushText = pendingBestTranscript {
+            pendingBestTranscript = nil
+            refiner.cancel()
+            textInjector.inject(flushText)
+            let duration = sessionStartDate.map { Date().timeIntervalSince($0) } ?? 0
+            HistoryStore.shared.record(
+                raw: flushText,
+                refined: nil,
+                durationSeconds: max(0, duration),
+                backend: sessionBackend,
+                injected: true,
+                audioWAV: pendingAudioWAV
+            )
+            pendingAudioWAV = nil
+        }
+
         isActive = true
         // A preview overlay may still be counting down; cancel it so its 4 s
         // callback can't tear down the overlay/AppState mid-session.
@@ -128,9 +157,6 @@ final class DictationController {
 
         Log.app.info("beginSession kind=\(String(describing: kind))")
 
-        // Pause media before touching audio hardware.
-        mediaController.pauseIfPlaying()
-
         // Update state to connecting immediately.
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
@@ -144,6 +170,11 @@ final class DictationController {
         overlayPanel.show()
 
         startEngine(kind: kind, generation: generation)
+
+        // Pause media after the mic is already starting: pauseIfPlaying only
+        // enqueues onto MediaController's background queue now, so it no
+        // longer blocks and doesn't need to go first.
+        mediaController.pauseIfPlaying()
     }
 
     /// Creates the ASR engine from the CURRENT settings, wires its callbacks
@@ -234,6 +265,7 @@ final class DictationController {
                 self.appState.phase = .error(error.localizedDescription)
                 DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
                     guard let self else { return }
+                    guard self.sessionGeneration == generation else { return }
                     self.overlayPanel.dismiss()
                     self.mediaController.resumeIfPaused()
                     self.appState.phase = .idle
@@ -367,6 +399,7 @@ final class DictationController {
         // Cancelled sessions are never recorded to history.
         pendingAudioWAV = nil
         sessionStartDate = nil
+        pendingBestTranscript = nil
 
         capturedSession?.cancel()
         refiner.cancel()
@@ -519,10 +552,12 @@ final class DictationController {
 
         if needsRefine {
             appState.phase = .refining
+            pendingBestTranscript = trimmed
 
             refiner.refine(trimmed) { [weak self] refined in
                 guard let self else { return }
                 guard self.sessionGeneration == generation else { return }
+                self.pendingBestTranscript = nil
                 // refiner completion is on main thread.
                 let refinedTrimmed = refined.trimmingCharacters(in: .whitespacesAndNewlines)
                 let finalText = refinedTrimmed.isEmpty ? trimmed : refined

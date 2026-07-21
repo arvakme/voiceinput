@@ -63,9 +63,10 @@ final class HTTPTranscriptionSession: TranscriptionSession {
         let gen = currentGeneration()
         Log.asr.info("HTTPTranscriptionSession stop(), gen=\(gen)")
 
-        // Snapshot the WAV before stopping the engine (so we get all samples).
-        let wavData = capture.sessionWAV
+        // Stop first, then snapshot — stop() flushes the sub-chunk remainder,
+        // so reading sessionWAV afterward captures every sample.
         capture.stop()
+        let wavData = capture.sessionWAV
 
         guard wavData.count > 44 else {
             // No audio recorded; deliver empty string.

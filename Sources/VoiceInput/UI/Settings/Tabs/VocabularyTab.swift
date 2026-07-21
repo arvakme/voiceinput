@@ -5,6 +5,7 @@ import SwiftUI
 /// Soniox recognition biasing and the polish prompt's correction list.
 struct VocabularyTab: View {
     @EnvironmentObject private var vocabulary: VocabularyStore
+    @EnvironmentObject private var settings: AppSettings
 
     @State private var selectedID: VocabularyEntry.ID?
 
@@ -24,8 +25,76 @@ struct VocabularyTab: View {
                     onRemove: removeSelected
                 )
             }
+
+            rimeImportCard
         }
     }
+
+    // MARK: Rime import
+
+    private var rimeImportCard: some View {
+        Card(padding: 18) {
+            CardHeading(
+                title: "Rime Import",
+                subtitle: "Folds terms learned by the 鼠须管 (Rime) input method — custom phrases and frequently-typed words — into the vocabulary above for recognition biasing only."
+            )
+
+            InlineRow(
+                title: "Import from Rime",
+                help: "Refreshes automatically shortly after VoiceInput launches."
+            ) {
+                BlueToggle(isOn: $settings.rimeImportEnabled)
+            }
+
+            Hairline()
+
+            HStack(alignment: .firstTextBaseline, spacing: 10) {
+                rimeStatusText
+                    .frame(maxWidth: .infinity, alignment: .leading)
+
+                Button {
+                    vocabulary.refreshFromRime()
+                } label: {
+                    HStack(spacing: 5) {
+                        if vocabulary.isRefreshingImportedTerms {
+                            ProgressView()
+                                .controlSize(.small)
+                                .scaleEffect(0.7)
+                        }
+                        Text("Refresh")
+                    }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.regular)
+                .tint(Theme.accent)
+                .disabled(vocabulary.isRefreshingImportedTerms)
+            }
+        }
+    }
+
+    private var rimeStatusText: some View {
+        Text(rimeStatusMessage)
+            .font(.system(size: 12))
+            .foregroundStyle(Theme.textSecondary)
+            .lineLimit(2)
+            .truncationMode(.tail)
+    }
+
+    private var rimeStatusMessage: String {
+        if let error = vocabulary.importedRefreshError {
+            return error
+        } else if let date = vocabulary.importedRefreshDate {
+            return "\(vocabulary.importedTermCount) terms · refreshed \(Self.relativeFormatter.localizedString(for: date, relativeTo: Date()))"
+        } else {
+            return "Not yet refreshed."
+        }
+    }
+
+    private static let relativeFormatter: RelativeDateTimeFormatter = {
+        let f = RelativeDateTimeFormatter()
+        f.unitsStyle = .full
+        return f
+    }()
 
     // MARK: Table
 

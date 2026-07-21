@@ -156,6 +156,10 @@ final class Refiner {
         request.setValue("VoiceInput", forHTTPHeaderField: "X-Title")
         request.timeoutInterval = 30
 
+        // Scale with input size so long dictations aren't cut off mid-polish;
+        // floor keeps short inputs room to expand, ceiling bounds worst case.
+        let maxTokens = min(8192, max(2048, input.count * 2))
+
         var body: [String: Any] = [
             "model": config.model,
             "messages": [
@@ -163,7 +167,7 @@ final class Refiner {
                 ["role": "user",   "content": input]
             ],
             "temperature": step.temperature,
-            "max_tokens": 2048,
+            "max_tokens": maxTokens,
             "stream": false
         ]
 
@@ -264,12 +268,23 @@ final class Refiner {
             guard
                 let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                 let choices = json["choices"] as? [[String: Any]],
-                let message = choices.first?["message"] as? [String: Any],
+                let choice = choices.first,
+                let message = choice["message"] as? [String: Any],
                 let content = message["content"] as? String
             else {
                 Log.refine.error("\(step.label) failed to parse choices[0].message.content")
                 DispatchQueue.main.async {
                     completion(.failure(RefinerError.invalidResponse(step.label)))
+                }
+                return
+            }
+
+            // A length-truncated response is worse than no response: injecting
+            // half a sentence silently is a correctness bug, not just an ugly one.
+            if choice["finish_reason"] as? String == "length" {
+                Log.refine.error("\(step.label) response truncated at max_tokens=\(maxTokens)")
+                DispatchQueue.main.async {
+                    completion(.failure(RefinerError.truncated(step.label)))
                 }
                 return
             }
@@ -449,6 +464,7 @@ If the transcript contains something like the left side, the speaker almost cert
         case invalidResponse(String)
         case requestSerializationFailed(String)
         case rateLimited(String)
+        case truncated(String)
         case cancelled
 
         var errorDescription: String? {
@@ -458,6 +474,7 @@ If the transcript contains something like the left side, the speaker almost cert
             case .invalidResponse(let step):              return "\(step): invalid response from LLM API"
             case .requestSerializationFailed(let step):   return "\(step): failed to serialize request"
             case .rateLimited(let step):                  return "\(step): rate limited (429)"
+            case .truncated(let step):                    return "\(step): response truncated (finish_reason=length)"
             case .cancelled:                              return "Refiner cancelled"
             }
         }

@@ -120,6 +120,7 @@ final class AppSettings: ObservableObject {
         static let translateModel               = "translateModel"
         static let polishReasoningEffort        = "polishReasoningEffort"
         static let vocabularyJSON               = "vocabularyJSON"
+        static let rimeImportEnabled            = "rimeImportEnabled"
         static let voiceBoxOpacity              = "voiceBoxOpacity"
         static let voiceBoxVerticalPosition     = "voiceBoxVerticalPosition"
         static let voiceBoxOriginX              = "voiceBoxOriginX"
@@ -213,6 +214,7 @@ final class AppSettings: ObservableObject {
         if d.object(forKey: Key.translateModel) == nil        { d.set("hy-mt2-1.8b-translate:latest", forKey: Key.translateModel) }
         if d.object(forKey: Key.polishReasoningEffort) == nil { d.set("low", forKey: Key.polishReasoningEffort) }
         if d.object(forKey: Key.vocabularyJSON) == nil        { d.set("[]", forKey: Key.vocabularyJSON) }
+        if d.object(forKey: Key.rimeImportEnabled) == nil     { d.set(true, forKey: Key.rimeImportEnabled) }
         if d.object(forKey: Key.voiceBoxOpacity) == nil       { d.set(0.25, forKey: Key.voiceBoxOpacity) }
         if d.object(forKey: Key.voiceBoxVerticalPosition) == nil { d.set(0.62, forKey: Key.voiceBoxVerticalPosition) }
         if d.object(forKey: Key.voiceBoxOriginX) == nil       { d.set(-1.0, forKey: Key.voiceBoxOriginX) }
@@ -414,6 +416,17 @@ final class AppSettings: ObservableObject {
         return v.isEmpty ? "[]" : v
     }() {
         didSet { defaults.set(vocabularyJSON, forKey: Key.vocabularyJSON) }
+    }
+
+    /// Whether to auto-import terms learned by the user's Rime (鼠须管) input
+    /// method into the Soniox recognition-biasing vocabulary.
+    @Published var rimeImportEnabled: Bool = {
+        if UserDefaults.standard.object(forKey: Key.rimeImportEnabled) != nil {
+            return UserDefaults.standard.bool(forKey: Key.rimeImportEnabled)
+        }
+        return true
+    }() {
+        didSet { defaults.set(rimeImportEnabled, forKey: Key.rimeImportEnabled) }
     }
 
     // MARK: - Appearance

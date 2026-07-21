@@ -46,7 +46,7 @@ final class SonioxListenSession: LiveCaptionSession {
 
         var config: [String: Any] = [
             "api_key": apiKey,
-            "model": model.isEmpty ? "stt-rt-v4" : model,
+            "model": model.isEmpty ? SonioxDefaults.realtimeModel : model,
             "audio_format": "pcm_s16le",
             "sample_rate": 16_000,
             "num_channels": 1,
