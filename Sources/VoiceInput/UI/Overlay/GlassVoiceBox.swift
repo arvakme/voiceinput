@@ -68,7 +68,12 @@ struct GlassVoiceBox: View {
     // ABOVE the sandwiched content, fogging the transcript/waveform/chips.
     var body: some View {
         Group {
-            if settings.voiceBoxCompact {
+            // The review editor cannot fit a capsule — force the expanded
+            // presentation for the review's duration regardless of the
+            // user's compact preference; OverlayPanel's contentSize/
+            // BoxResizeController mirror this same OR so the panel FRAME
+            // actually grows to match (see their `isCompactPresentation`).
+            if settings.voiceBoxCompact && !isReviewing {
                 compactBody
             } else {
                 expandedBody
@@ -94,6 +99,8 @@ struct GlassVoiceBox: View {
                 // sits on the box's one glass surface (see body's note).
                 ReviewEditorView(
                     original: state.reviewText,
+                    awaitingInsert: state.reviewAwaitingInsert,
+                    countdown: state.reviewCountdown,
                     onEditStart: onReviewEditStart,
                     onApply: onApplyReview
                 )
@@ -805,31 +812,63 @@ private struct GlassActionButton: View {
 
 /// Post-dictation review: fills the same space `transcriptArea` +
 /// `WaveformView` + `bottomBar` occupy while `state.phase == .reviewing` — a
-/// plain multiline editor pre-filled with the just-injected text, a quiet
-/// hint line, and an Apply button. Deliberately carries no background/border
-/// of its own (transparent, Theme colors only) so the box still has exactly
-/// ONE Liquid Glass surface (the shared background in `GlassVoiceBox.body`).
+/// plain multiline editor pre-filled with the review text, a quiet hint line,
+/// and an Apply/Insert button. Deliberately carries no background/border of
+/// its own (transparent, Theme colors only) so the box still has exactly ONE
+/// Liquid Glass surface (the shared background in `GlassVoiceBox.body`).
+///
+/// Two modes share this one view (see `AppSettings.ReviewMode`):
+/// - "after" (`awaitingInsert == false`): the text is ALREADY in the target
+///   app; Apply only appears once dirty, and only edits get applied.
+/// - "before" (`awaitingInsert == true`): the text has NOT been injected yet;
+///   an always-visible "Insert now" affordance inserts whatever's currently in
+///   the box (edited or not), and a quiet countdown hint shows the pending
+///   auto-insert until the user touches the editor.
 ///
 /// Owns its own edit buffer (`text`, seeded from `original` at init) rather
 /// than binding directly to `AppState.reviewText` — `AppState` is written
 /// exclusively by `DictationController` (see its doc comment); keystrokes
-/// here stay local until Apply hands the result back through `onApply`.
+/// here stay local until Apply/Insert hands the result back through `onApply`.
 private struct ReviewEditorView: View {
     let original: String
+    let awaitingInsert: Bool
+    let countdown: Double?
     var onEditStart: () -> Void
     var onApply: (String) -> Void
 
     @State private var text: String
     @FocusState private var isFocused: Bool
 
-    init(original: String, onEditStart: @escaping () -> Void, onApply: @escaping (String) -> Void) {
+    init(original: String,
+         awaitingInsert: Bool,
+         countdown: Double?,
+         onEditStart: @escaping () -> Void,
+         onApply: @escaping (String) -> Void) {
         self.original = original
+        self.awaitingInsert = awaitingInsert
+        self.countdown = countdown
         self.onEditStart = onEditStart
         self.onApply = onApply
         _text = State(initialValue: original)
     }
 
     private var isDirty: Bool { text != original }
+
+    // "before" mode's Insert-now affordance is always visible/actionable — it
+    // inserts whatever's currently in the box, edited or not. "after" mode's
+    // Apply only appears once there's actually something to apply (unchanged
+    // from before this feature).
+    private var buttonVisible: Bool { awaitingInsert || isDirty }
+
+    private var buttonLabel: String { awaitingInsert ? "Insert now" : "Apply" }
+
+    private var hintText: String {
+        guard awaitingInsert else { return "⌘⏎ apply · esc dismiss" }
+        if let countdown {
+            return "auto-insert in \(String(format: "%.1f", max(0, countdown)))s — click to edit"
+        }
+        return "⌘⏎ insert · esc discard"
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -840,31 +879,33 @@ private struct ReviewEditorView: View {
                 .background(Color.clear)
                 .focused($isFocused)
                 // The user "touching" the editor — not merely the review
-                // opening — is the signal that cancels the auto-dismiss
-                // timer, so a reviewer who does nothing still sees it fade.
+                // opening — is the signal that cancels the auto-dismiss/
+                // auto-insert timer, so a reviewer who does nothing still
+                // sees it run to completion.
                 .onChange(of: isFocused) { _, focused in
                     if focused { onEditStart() }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
 
             HStack(spacing: 10) {
-                Text("⌘⏎ apply · esc dismiss")
+                Text(hintText)
                     .font(.system(size: 11))
                     .foregroundStyle(Theme.textSecondary.opacity(0.7))
                 Spacer()
                 Button(action: { onApply(text) }) {
-                    Text("Apply")
+                    Text(buttonLabel)
                         .font(.system(size: 12, weight: .semibold))
                         .foregroundStyle(Theme.accent)
                 }
                 .buttonStyle(.plain)
                 // Kept in the hierarchy (only visually/hit-test hidden when
-                // unchanged) so ⌘⏎ always applies — DictationController's
-                // applyReview treats an unchanged result as a plain dismiss.
+                // not applicable) so ⌘⏎ always fires — DictationController's
+                // applyReview treats an unchanged "after"-mode result as a
+                // plain dismiss.
                 .keyboardShortcut(.return, modifiers: .command)
-                .opacity(isDirty ? 1 : 0)
-                .allowsHitTesting(isDirty)
-                .animation(.easeOut(duration: 0.12), value: isDirty)
+                .opacity(buttonVisible ? 1 : 0)
+                .allowsHitTesting(buttonVisible)
+                .animation(.easeOut(duration: 0.12), value: buttonVisible)
             }
         }
     }

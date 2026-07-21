@@ -117,6 +117,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if dictationController.isSessionActive {
             dictationController.cancelSession()
         }
+        dictationController.resolvePendingReviewForTermination()
+        HistoryStore.shared.waitForPendingWrites(timeout: 2)
         // Blocking wrapper used ONLY here: applicationWillTerminate has no way
         // to keep the process alive for the normal async resume, so quitting
         // mid-dictation could leave Spotify/Music paused forever otherwise.

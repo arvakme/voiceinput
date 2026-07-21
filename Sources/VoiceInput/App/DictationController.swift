@@ -67,11 +67,31 @@ final class DictationController {
     // Preview overlay state
     private var previewTimer: Timer?
 
-    // Post-dictation review state (see `beginReview`/`applyReview`/`dismissReview`)
+    // Post-dictation review state (see `beginReviewAfterInsert`/
+    // `beginReviewBeforeInsert`/`applyReview`/`dismissReview`/`abandonReview`)
     private var reviewTimer: Timer?
     private var reviewHistoryID: UUID?
     private var reviewRawTranscript: String = ""
     private var reviewBackend: String = ""
+
+    /// "before" mode only: the review hasn't injected (or recorded to
+    /// history) yet, so these snapshot what the normal inject step would have
+    /// recorded, deferred until the review actually resolves.
+    private var reviewRefinedTranscript: String?
+    private var reviewDurationSeconds: Double = 0
+    private var reviewAudioWAV: Data?
+
+    /// Which mode produced the CURRENT `.reviewing` phase — captured once at
+    /// entry (not re-read from settings) so a settings change mid-review
+    /// can't retroactively alter how it resolves. `.off` when no review is
+    /// live; used to route `applyReview`/Esc/interruption to the right
+    /// resolution instead of branching on `settings.reviewMode` everywhere.
+    private var activeReviewMode: ReviewMode = .off
+
+    /// Ticks `AppState.reviewCountdown` for a "before"-mode review at a 0.5 s
+    /// cadence. `nil` whenever no countdown is running.
+    private var reviewCountdownTimer: Timer?
+    private var reviewCountdownDeadline: Date?
 
     // MARK: - Init
 
@@ -94,11 +114,14 @@ final class DictationController {
         overlayPanel.onCancel = { [weak self] in
             guard let self else { return }
             // Esc/Cancel means different things depending on phase: mid-session
-            // it aborts the dictation (never injected); during review the
-            // session already ended and injected — Esc there just dismisses
-            // the review UI without touching what's already in the target app.
+            // it aborts the dictation (never injected). During review the
+            // session already ended — "after" mode already injected, so Esc
+            // there just dismisses the UI without touching the target app;
+            // "before" mode never injected, so Esc there resolves as
+            // abandoned (recorded to history, never inserted) — see
+            // `abandonReview`.
             if case .reviewing = self.appState.phase {
-                self.dismissReview()
+                self.abandonReview()
             } else {
                 self.cancelSession()
             }
@@ -135,9 +158,11 @@ final class DictationController {
     }
 
     /// Whether a dictation session is currently in flight. A post-dictation
-    /// review does NOT count — that session already ended (inject + history
-    /// already happened); exposed so AppDelegate's applicationWillTerminate
-    /// knows whether cancelSession() has anything real left to cancel.
+    /// review does NOT count — that session already ended (its ASR/refine
+    /// pipeline is done; "after" mode has already injected + recorded, and
+    /// "before" mode resolves its own deferred recording on the review's own
+    /// exit paths); exposed so AppDelegate's applicationWillTerminate knows
+    /// whether cancelSession() has anything real left to cancel.
     var isSessionActive: Bool { isActive }
 
     /// Begin a dictation session. Re-entrancy guard: ignored if a session is already active.
@@ -148,12 +173,13 @@ final class DictationController {
         }
 
         // A post-dictation review may still be showing (it reuses this same
-        // overlay/panel). Its transcript was already recorded when that
-        // session ended, so — unlike the pendingBestTranscript flush right
-        // below — there's nothing to flush, just UI state to tear down before
-        // this new session claims the panel.
+        // overlay/panel). "after" mode already recorded its transcript when
+        // that session ended, so there's just UI state to tear down; "before"
+        // mode never injected, so per spec this resolves as ABANDONED — record
+        // history (injected: false) rather than silently losing it or
+        // injecting stale text into whatever the user is now doing.
         if case .reviewing = appState.phase {
-            dismissReview()
+            abandonReview()
         }
 
         // A refine pipeline from the PREVIOUS session may still be in flight
@@ -431,12 +457,13 @@ final class DictationController {
     /// Cancel: discard transcript, do not inject.
     /// Idempotent.
     func cancelSession() {
-        // A review has no live session to cancel (it already injected) — just
-        // tear down its UI. Handled here (rather than left as a silent no-op
-        // below) so e.g. disabling the app mid-review still cleans up the
-        // panel's temporary key-focus grant.
+        // A review has no live session to cancel — "after" mode already
+        // injected, so this is just UI teardown; "before" mode resolves as
+        // abandoned (see beginSession's identical handling). Handled here
+        // (rather than left as a silent no-op below) so e.g. disabling the
+        // app mid-review still cleans up the panel's temporary key-focus grant.
         if case .reviewing = appState.phase {
-            dismissReview()
+            abandonReview()
             return
         }
         guard isActive else {
@@ -638,6 +665,21 @@ final class DictationController {
                                  refined: String?,
                                  generation: UInt64,
                                  externallyEnded: Bool) {
+        let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // "before" mode never injects sight-unseen — hand off to the
+        // pre-insert review path instead of the inject-then-maybe-review flow
+        // below. (finishAfterTranscript already filtered empty transcripts;
+        // the emptiness check here is just defensive.)
+        if settings.reviewMode == .before && !trimmedText.isEmpty {
+            beginReviewBeforeInsert(text: text,
+                                    raw: raw,
+                                    refined: refined,
+                                    generation: generation,
+                                    externallyEnded: externallyEnded)
+            return
+        }
+
         appState.phase = .injecting
 
         // Snapshot history inputs now so they survive the deferred closure.
@@ -675,9 +717,8 @@ final class DictationController {
                 self.onSessionEndedExternally?()
             }
 
-            let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
-            if self.settings.reviewEnabled && !trimmedText.isEmpty {
-                self.beginReview(injectedText: text, raw: raw, backend: backend, historyID: recordID, generation: generation)
+            if self.settings.reviewMode == .after && !trimmedText.isEmpty {
+                self.beginReviewAfterInsert(injectedText: text, raw: raw, backend: backend, historyID: recordID, generation: generation)
             } else {
                 self.overlayPanel.dismiss()
                 self.appState.phase = .idle
@@ -690,20 +731,23 @@ final class DictationController {
 
     // MARK: - Post-dictation review
 
-    /// Keeps the overlay up showing the just-injected `injectedText` so the
-    /// user can fix a mishearing in place. Arms a generation-guarded
-    /// auto-dismiss timer and grants the panel temporary key focus (see
-    /// `OverlayPanel.allowsKeyFocus`) so a click into the review editor works.
-    private func beginReview(injectedText: String,
-                             raw: String,
-                             backend: String,
-                             historyID: UUID?,
-                             generation: UInt64) {
+    /// "after" mode — EXACTLY today's (pre-existing) behavior: the overlay
+    /// stays up showing the just-injected `injectedText` so the user can fix
+    /// a mishearing in place. Arms a generation-guarded auto-dismiss timer and
+    /// grants the panel temporary key focus (see `OverlayPanel.allowsKeyFocus`)
+    /// so a click into the review editor works.
+    private func beginReviewAfterInsert(injectedText: String,
+                                        raw: String,
+                                        backend: String,
+                                        historyID: UUID?,
+                                        generation: UInt64) {
+        activeReviewMode = .after
         reviewRawTranscript = raw
         reviewBackend = backend
         reviewHistoryID = historyID
 
         appState.reviewText = injectedText
+        appState.reviewAwaitingInsert = false
         appState.phase = .reviewing
         appState.transcript = TranscriptSnapshot()
         appState.silenceCountdown = nil
@@ -719,32 +763,175 @@ final class DictationController {
         }
     }
 
-    /// Cancels the review's auto-dismiss timer. Fired once the user actually
-    /// focuses the review editor — per spec, once they touch it, it waits.
+    /// "before" mode — the just-refined `text` has NOT been injected yet.
+    /// Snapshots everything the normal inject step would have recorded to
+    /// history (so it survives however long the review dwell runs), finishes
+    /// the session's sequencing (media resume, KeyMonitor reset) at exactly
+    /// the same point the inject path does, then shows the review editor with
+    /// a live auto-insert countdown.
+    private func beginReviewBeforeInsert(text: String,
+                                         raw: String,
+                                         refined: String?,
+                                         generation: UInt64,
+                                         externallyEnded: Bool) {
+        let startDate = sessionStartDate
+        let backend = sessionBackend
+        let audioWAV = pendingAudioWAV
+        pendingAudioWAV = nil
+        let duration = startDate.map { Date().timeIntervalSince($0) } ?? 0
+        sessionStartDate = nil
+
+        // The session is over here — same sequencing point as the inject
+        // path above, just without having injected anything yet.
+        mediaController.resumeIfPaused()
+        if externallyEnded {
+            onSessionEndedExternally?()
+        }
+
+        activeReviewMode = .before
+        reviewRawTranscript = raw
+        reviewRefinedTranscript = refined
+        reviewBackend = backend
+        reviewDurationSeconds = duration
+        reviewAudioWAV = audioWAV
+        reviewHistoryID = nil
+
+        appState.reviewText = text
+        appState.reviewAwaitingInsert = true
+        appState.phase = .reviewing
+        appState.transcript = TranscriptSnapshot()
+        appState.silenceCountdown = nil
+        appState.sessionKind = nil
+
+        overlayPanel.allowsKeyFocus = true
+
+        armReviewCountdown(generation: generation)
+    }
+
+    /// Cancels the review's auto-dismiss/auto-insert timers. Fired once the
+    /// user actually focuses the review editor — per spec, once they touch
+    /// it, it waits (no more ticking, no more surprise auto-resolution).
     private func cancelReviewAutoDismiss() {
         reviewTimer?.invalidate()
         reviewTimer = nil
+        cancelReviewCountdown()
     }
 
-    /// Ends a review without applying any edit: dismisses the overlay, drops
-    /// back to idle, clears the review text, and revokes the panel's
-    /// temporary key-focus grant. Safe to call even if no review is live.
+    /// Ticks `AppState.reviewCountdown` down from `settings.reviewSeconds` at
+    /// a gentle 0.5 s cadence (a smooth ring would need a per-frame
+    /// `TimelineView`, which `.reviewing` deliberately stays excluded from —
+    /// see WaveformView's `isLive`). Auto-inserts the untouched text once it
+    /// reaches zero.
+    private func armReviewCountdown(generation: UInt64) {
+        reviewCountdownTimer?.invalidate()
+        let seconds = max(0.5, settings.reviewSeconds)
+        reviewCountdownDeadline = Date().addingTimeInterval(seconds)
+        appState.reviewCountdown = seconds
+        reviewCountdownTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+            guard let self, self.sessionGeneration == generation else { return }
+            self.tickReviewCountdown()
+        }
+    }
+
+    private func tickReviewCountdown() {
+        guard case .reviewing = appState.phase,
+              activeReviewMode == .before,
+              let deadline = reviewCountdownDeadline else {
+            cancelReviewCountdown()
+            return
+        }
+        let remaining = deadline.timeIntervalSinceNow
+        guard remaining > 0 else {
+            cancelReviewCountdown()
+            // Untouched dwell: insert the text exactly as shown.
+            applyReviewBefore(corrected: appState.reviewText)
+            return
+        }
+        appState.reviewCountdown = remaining
+    }
+
+    private func cancelReviewCountdown() {
+        reviewCountdownTimer?.invalidate()
+        reviewCountdownTimer = nil
+        reviewCountdownDeadline = nil
+        appState.reviewCountdown = nil
+    }
+
+    /// Ends a review with no further recording of its own — any recording
+    /// that resolving it requires (insert-now/apply-edited/timeout via
+    /// `applyReviewBefore`, or abandonment via `abandonReview`) must happen
+    /// BEFORE calling this. Dismisses the overlay, drops back to idle, clears
+    /// all review state, and revokes the panel's temporary key-focus grant.
+    /// Safe to call even if no review is live. Every review exit path funnels
+    /// through here so the countdown timer and key-focus grant are never left
+    /// dangling.
     private func dismissReview() {
         reviewTimer?.invalidate()
         reviewTimer = nil
+        cancelReviewCountdown()
         reviewHistoryID = nil
+        reviewRefinedTranscript = nil
+        reviewAudioWAV = nil
+        activeReviewMode = .off
         overlayPanel.allowsKeyFocus = false
         overlayPanel.dismiss()
         appState.phase = .idle
         appState.reviewText = ""
+        appState.reviewAwaitingInsert = false
     }
 
-    /// Applies the user's edit from the review editor. If it matches the
-    /// original injected text, this is just a dismiss; otherwise the injected
-    /// text is replaced in the target app and the correction is recorded as
-    /// gold-standard data.
+    /// Resolves a `.reviewing` phase that's being interrupted rather than
+    /// explicitly resolved — Esc, a new `beginSession` reclaiming the panel,
+    /// or an explicit `cancelSession`. "after" mode already injected and
+    /// recorded to history when the review began, so this is pure UI
+    /// teardown; "before" mode never injected, so — per "the transcript is
+    /// sacred" — this still records the session to history with
+    /// `injected: false` before tearing down, so an abandoned "before" review
+    /// is never silently lost.
+    /// applicationWillTerminate hook: a pending "before" review has been
+    /// recorded NOWHERE yet (inject and history are both deferred to its
+    /// resolution), so quitting mid-review would lose the transcript
+    /// entirely. Resolve it as abandoned; pair with
+    /// `HistoryStore.waitForPendingWrites` so the async write lands.
+    func resolvePendingReviewForTermination() {
+        if case .reviewing = appState.phase {
+            abandonReview()
+        }
+    }
+
+    private func abandonReview() {
+        if activeReviewMode == .before {
+            HistoryStore.shared.record(
+                raw: reviewRawTranscript,
+                refined: reviewRefinedTranscript,
+                durationSeconds: max(0, reviewDurationSeconds),
+                backend: reviewBackend,
+                injected: false,
+                audioWAV: reviewAudioWAV
+            )
+        }
+        dismissReview()
+    }
+
+    /// Applies the user's action from the review editor — semantics differ by
+    /// which mode produced the current review (see `activeReviewMode`).
     func applyReview(corrected: String) {
         guard case .reviewing = appState.phase else { return }
+        switch activeReviewMode {
+        case .before:
+            applyReviewBefore(corrected: corrected)
+        case .after:
+            applyReviewAfterInsert(corrected: corrected)
+        case .off:
+            break // Unreachable: no review is ever shown while off.
+        }
+    }
+
+    /// "after" mode — EXACTLY today's (pre-existing) behavior: if the edit
+    /// matches the original injected text this is just a dismiss; otherwise
+    /// the injected text is replaced in the target app (undo + re-paste) and
+    /// the correction is recorded as gold-standard data.
+    private func applyReviewAfterInsert(corrected: String) {
         let original = appState.reviewText
 
         guard corrected != original else {
@@ -764,6 +951,50 @@ final class DictationController {
         }
 
         textInjector.replaceLastInjection(with: corrected)
+
+        dismissReview()
+    }
+
+    /// "before" mode — nothing has been injected yet, whether this fires from
+    /// the countdown elapsing untouched, the "Insert now" affordance, or
+    /// ⌘⏎/Apply after an edit. Injects `corrected` directly (plain
+    /// `TextInjector.inject` — no undo dance needed, there is nothing prior to
+    /// undo) and records the deferred history entry now that the outcome is
+    /// known. When the text differs from what was shown (the user actually
+    /// edited it), also appends the CorrectionStore gold-standard triple and
+    /// sets `correctedTranscript` on the freshly-written record — the same
+    /// recording shape as `applyReviewAfterInsert`, just against a record that
+    /// didn't exist until this moment.
+    private func applyReviewBefore(corrected: String) {
+        let original = appState.reviewText
+
+        guard !corrected.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            // Nothing to insert — treat like an abandoned review rather than
+            // recording a phantom injection of empty text.
+            abandonReview()
+            return
+        }
+
+        textInjector.inject(corrected)
+
+        let recordID = HistoryStore.shared.record(
+            raw: reviewRawTranscript,
+            refined: reviewRefinedTranscript,
+            durationSeconds: max(0, reviewDurationSeconds),
+            backend: reviewBackend,
+            injected: true,
+            audioWAV: reviewAudioWAV
+        )
+
+        if corrected != original {
+            CorrectionStore.shared.append(
+                raw: reviewRawTranscript,
+                injected: original,
+                corrected: corrected,
+                backend: reviewBackend
+            )
+            HistoryStore.shared.updateCorrection(id: recordID, corrected: corrected)
+        }
 
         dismissReview()
     }

@@ -83,6 +83,30 @@ enum TranslateTarget: String, CaseIterable {
     }
 }
 
+// MARK: - ReviewMode
+
+/// Whether/when the post-dictation review box shows up.
+enum ReviewMode: String, CaseIterable {
+    /// Inject immediately, no review UI (today's non-review path).
+    case off
+    /// EXACTLY the original review behavior: inject first, then show the
+    /// just-injected text so a mishearing can be fixed in place (Cmd-Z +
+    /// re-paste on edit).
+    case after
+    /// The refined text is shown BEFORE it touches the target app; it is
+    /// injected only once the countdown elapses untouched or the user
+    /// explicitly inserts/applies it. Esc discards without injecting.
+    case before
+
+    var displayName: String {
+        switch self {
+        case .off:    return "Off"
+        case .after:  return "Review after insert"
+        case .before: return "Review before insert"
+        }
+    }
+}
+
 // MARK: - AppSettings
 
 final class AppSettings: ObservableObject {
@@ -157,7 +181,10 @@ final class AppSettings: ObservableObject {
         static let historyEnabled               = "historyEnabled"
         static let historyKeepAudio             = "historyKeepAudio"
         static let historyMaxSessions           = "historyMaxSessions"
+        /// Legacy key from the boolean-review era, read only by the one-time
+        /// `reviewMode` migration below — never written again.
         static let reviewEnabled                = "reviewEnabled"
+        static let reviewMode                   = "reviewMode"
         static let reviewSeconds                = "reviewSeconds"
     }
 
@@ -261,7 +288,20 @@ final class AppSettings: ObservableObject {
         if d.object(forKey: Key.historyEnabled) == nil        { d.set(true, forKey: Key.historyEnabled) }
         if d.object(forKey: Key.historyKeepAudio) == nil      { d.set(true, forKey: Key.historyKeepAudio) }
         if d.object(forKey: Key.historyMaxSessions) == nil    { d.set(200, forKey: Key.historyMaxSessions) }
-        if d.object(forKey: Key.reviewEnabled) == nil         { d.set(true, forKey: Key.reviewEnabled) }
+        if d.object(forKey: Key.reviewMode) == nil {
+            // One-time migration from the boolean era: `reviewEnabled == true`
+            // used to mean "show the after-insert review box" — that IS what
+            // "after" mode is now, but the point of this migration is that
+            // those users move to "before" instead (see user feedback: text
+            // was landing before they'd seen it). A truly fresh install (no
+            // legacy key at all) also seeds "before" as the default.
+            if d.object(forKey: Key.reviewEnabled) != nil {
+                let legacyEnabled = d.bool(forKey: Key.reviewEnabled)
+                d.set(legacyEnabled ? ReviewMode.before.rawValue : ReviewMode.off.rawValue, forKey: Key.reviewMode)
+            } else {
+                d.set(ReviewMode.before.rawValue, forKey: Key.reviewMode)
+            }
+        }
         if d.object(forKey: Key.reviewSeconds) == nil         { d.set(6.0, forKey: Key.reviewSeconds) }
     }
 
@@ -698,19 +738,18 @@ final class AppSettings: ObservableObject {
 
     // MARK: - Post-dictation review
 
-    /// Whether the overlay stays up briefly after inject so the user can fix
-    /// a mishearing in place (see DictationController's review flow).
-    @Published var reviewEnabled: Bool = {
-        if UserDefaults.standard.object(forKey: Key.reviewEnabled) != nil {
-            return UserDefaults.standard.bool(forKey: Key.reviewEnabled)
-        }
-        return true
+    /// Whether/when the post-dictation review box shows up (see `ReviewMode`
+    /// and DictationController's review flow).
+    @Published var reviewMode: ReviewMode = {
+        let raw = UserDefaults.standard.string(forKey: Key.reviewMode) ?? ReviewMode.before.rawValue
+        return ReviewMode(rawValue: raw) ?? .before
     }() {
-        didSet { defaults.set(reviewEnabled, forKey: Key.reviewEnabled) }
+        didSet { defaults.set(reviewMode.rawValue, forKey: Key.reviewMode) }
     }
 
-    /// Review auto-dismiss dwell, in seconds. No UI control — power users can
-    /// tune it with `defaults write com.zhijie.VoiceInput reviewSeconds <n>`.
+    /// Review dwell, in seconds: for "after" mode, how long the corrected-in-
+    /// place box stays up before auto-dismissing; for "before" mode, the
+    /// auto-insert countdown. Range 1–15 s in the General tab.
     @Published var reviewSeconds: Double = {
         if UserDefaults.standard.object(forKey: Key.reviewSeconds) != nil {
             return UserDefaults.standard.double(forKey: Key.reviewSeconds)

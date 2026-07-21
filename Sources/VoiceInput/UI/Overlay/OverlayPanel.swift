@@ -41,6 +41,11 @@ final class OverlayPanel {
     private var escLocalMonitor: Any?
     private var moveObserver: Any?
     private var compactObserver: AnyCancellable?
+    /// Resizes the panel frame between capsule/box dimensions as `.reviewing`
+    /// is entered/left while the user's preference is compact — see
+    /// `isCompactPresentation`. Change 2: the review editor cannot fit a
+    /// capsule.
+    private var reviewPresentationObserver: AnyCancellable?
 
     /// Suppresses the didMove observer while `positionPanel` places the window
     /// itself, so only user drags persist a custom origin.
@@ -183,6 +188,7 @@ final class OverlayPanel {
         self.hostingView = hosting
         resizeController.panel = panel
         resizeController.settings = settings
+        resizeController.state = state
 
         // Box ↔ capsule toggles swap the panel to the other form's size,
         // keeping the visual center where the user had it.
@@ -191,6 +197,20 @@ final class OverlayPanel {
             .dropFirst()
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in self?.adoptContentSizeKeepingCenter() }
+
+        // Change 2: entering/leaving `.reviewing` overrides the compact
+        // preference (see `isCompactPresentation`) — resize the frame the
+        // same way a manual compact toggle does, so the review editor always
+        // gets the full expanded canvas, then shrinks back once it resolves.
+        reviewPresentationObserver = state.$phase
+            .map { $0 == .reviewing }
+            .removeDuplicates()
+            .dropFirst()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                guard let self, self.settings.voiceBoxCompact else { return }
+                self.adoptContentSizeKeepingCenter()
+            }
 
         return panel
     }
@@ -226,10 +246,24 @@ final class OverlayPanel {
     /// dragging the panel edges (via BoxResizeController) resizes it like a
     /// window.
     private var contentSize: NSSize {
-        if settings.voiceBoxCompact {
+        if isCompactPresentation {
             return NSSize(width: settings.capsuleWidth + 80, height: settings.capsuleHeight + 80)
         }
         return NSSize(width: settings.voiceBoxWidth + 80, height: settings.voiceBoxHeight + 80)
+    }
+
+    /// Whether the panel should currently size/frame itself as the compact
+    /// capsule. The user's `voiceBoxCompact` preference is honored EXCEPT
+    /// during `.reviewing`: the review editor cannot fit a capsule, so the
+    /// panel is temporarily forced to the expanded form's dimensions for the
+    /// review's duration (`reviewPresentationObserver` drives the actual
+    /// frame resize) and the user's capsule choice is restored the moment it
+    /// resolves. Never persisted to settings — this only ever affects THIS
+    /// derived size, not `settings.voiceBoxCompact` itself. Mirrors
+    /// `GlassVoiceBox`'s identical `settings.voiceBoxCompact && !isReviewing`
+    /// OR so the SwiftUI presentation and the AppKit panel frame always agree.
+    private var isCompactPresentation: Bool {
+        settings.voiceBoxCompact && state.phase != .reviewing
     }
 
     // MARK: - Positioning
@@ -327,20 +361,34 @@ struct ResizeEdges: OptionSet {
 final class BoxResizeController {
     weak var panel: NSPanel?
     weak var settings: AppSettings?
+    /// Needed only to mirror `OverlayPanel.isCompactPresentation`'s
+    /// `.reviewing` override — see `isCompactPresentation` below.
+    weak var state: AppState?
 
     private(set) var isResizing = false
     private var startFrame: NSRect = .zero
     private var startMouse: NSPoint = .zero
 
+    /// Mirrors `OverlayPanel.isCompactPresentation`: the review editor forces
+    /// the expanded form regardless of `settings.voiceBoxCompact`, so a drag
+    /// during a review must use the expanded bounds/persist to the expanded
+    /// dimensions — otherwise a resize mid-review would clamp to capsule
+    /// min/max sizes and, on `end()`, silently overwrite the user's capsule
+    /// dimensions with the box's.
+    private var isCompactPresentation: Bool {
+        guard settings?.voiceBoxCompact == true else { return false }
+        return state?.phase != .reviewing
+    }
+
     // Panel-space limits = content limits + the 80 pt shadow canvas,
     // depending on which form is showing.
     private var minSize: NSSize {
-        settings?.voiceBoxCompact == true
+        isCompactPresentation
             ? NSSize(width: 220 + 80, height: 40 + 80)
             : NSSize(width: 480 + 80, height: 170 + 80)
     }
     private var maxSize: NSSize {
-        settings?.voiceBoxCompact == true
+        isCompactPresentation
             ? NSSize(width: 800 + 80, height: 96 + 80)
             : NSSize(width: 1400 + 80, height: 640 + 80)
     }
@@ -382,8 +430,11 @@ final class BoxResizeController {
         isResizing = false
         guard let panel, let settings else { return }
         // Persist the current form's dimensions (minus shadow canvas) and the
-        // new origin so it reappears exactly as left.
-        if settings.voiceBoxCompact {
+        // new origin so it reappears exactly as left. Uses the SAME
+        // `.reviewing` override as minSize/maxSize above, so a mid-review
+        // resize persists to voiceBoxWidth/Height (what's actually on
+        // screen), never capsuleWidth/Height.
+        if isCompactPresentation {
             settings.capsuleWidth = panel.frame.width - 80
             settings.capsuleHeight = panel.frame.height - 80
         } else {

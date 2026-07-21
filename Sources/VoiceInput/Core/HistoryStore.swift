@@ -54,6 +54,16 @@ final class HistoryStore: ObservableObject {
         loadInitial()
     }
 
+    /// Blocks the calling thread until every write enqueued so far has hit
+    /// disk, or `timeout` elapses. Used ONLY from applicationWillTerminate:
+    /// `record`'s io.async write would otherwise race process exit and an
+    /// abandoned pre-insert review could vanish without a trace.
+    func waitForPendingWrites(timeout: TimeInterval) {
+        let semaphore = DispatchSemaphore(value: 0)
+        io.async { semaphore.signal() }
+        _ = semaphore.wait(timeout: .now() + timeout)
+    }
+
     // MARK: - Locations
 
     /// `~/Library/Application Support/VoiceInput/`

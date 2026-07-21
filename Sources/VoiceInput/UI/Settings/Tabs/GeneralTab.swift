@@ -40,9 +40,31 @@ struct GeneralTab: View {
 
                 InlineRow(
                     title: "Post-dictation review",
-                    help: "Shows the injected text for a few seconds so you can fix mishearings in place. Your edits also teach the vocabulary system."
+                    help: "Before insert: see the text and let it auto-insert, or fix it first. After insert: fix a mishearing in place once it's already landed. Edits also teach the vocabulary system."
                 ) {
-                    BlueToggle(isOn: $settings.reviewEnabled)
+                    ThemedPicker(selection: $settings.reviewMode, width: 190) {
+                        ForEach(ReviewMode.allCases, id: \.self) { mode in
+                            Text(mode.displayName).tag(mode)
+                        }
+                    }
+                }
+
+                if settings.reviewMode != .off {
+                    Hairline()
+
+                    FieldRow(
+                        title: "Review duration",
+                        help: "\"Before insert\": auto-insert countdown. \"After insert\": how long the box stays up."
+                    ) {
+                        HStack(spacing: 12) {
+                            Slider(value: $settings.reviewSeconds, in: 1...15, step: 0.5)
+                                .tint(Theme.accent)
+                            Text(String(format: "%.1fs", settings.reviewSeconds))
+                                .font(.system(size: 13, design: .monospaced))
+                                .foregroundStyle(Theme.textPrimary)
+                                .frame(width: 48, alignment: .trailing)
+                        }
+                    }
                 }
             }
         }

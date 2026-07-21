@@ -61,11 +61,27 @@ final class AppState: ObservableObject {
     /// The kind of the currently active session. `nil` when no session is active.
     @Published var sessionKind: SessionKind? = nil
 
-    /// The injected text shown for editing during `.reviewing`. Kept separate
-    /// from `phase` (rather than an associated value) so the phase enum stays
-    /// a simple switch target everywhere else. Only meaningful while
-    /// `phase == .reviewing`.
+    /// The text shown for editing during `.reviewing`. In "after" mode this is
+    /// already sitting in the target app; in "before" mode it has NOT been
+    /// injected yet. Kept separate from `phase` (rather than an associated
+    /// value) so the phase enum stays a simple switch target everywhere else.
+    /// Only meaningful while `phase == .reviewing`.
     @Published var reviewText: String = ""
+
+    /// True while the current `.reviewing` phase is "before"-mode: `reviewText`
+    /// has NOT been inserted into the target app yet, so the editor renders
+    /// as an insert decision rather than a correct-what's-already-there box
+    /// (see `AppSettings.ReviewMode` and DictationController's review flow).
+    /// Only meaningful while `phase == .reviewing`.
+    @Published var reviewAwaitingInsert: Bool = false
+
+    /// Seconds remaining before a "before"-mode review auto-inserts.
+    /// `nil` whenever no countdown is running — "after"/"off" review, or once
+    /// the user has touched the editor (touching cancels it; see
+    /// DictationController.cancelReviewAutoDismiss). Ticked at a 0.5 s
+    /// cadence, not a per-frame clock — see WaveformView's phase-gating note
+    /// on why `.reviewing` must never need a `TimelineView`.
+    @Published var reviewCountdown: Double? = nil
 
     private init() {}
 }
