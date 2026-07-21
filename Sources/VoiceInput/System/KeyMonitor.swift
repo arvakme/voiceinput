@@ -262,6 +262,11 @@ final class KeyMonitor {
         if key == .customShortcut {
             mask |= CGEventMask(1 << CGEventType.keyDown.rawValue)
             mask |= CGEventMask(1 << CGEventType.keyUp.rawValue)
+        } else if key == .fn {
+            // Watch keyDown too so we can tell "Fn held to talk" apart from
+            // "Fn held as a system modifier" (Fn+Space, Fn+arrow, ...) — see
+            // handleCGEvent.
+            mask |= CGEventMask(1 << CGEventType.keyDown.rawValue)
         }
         let refcon = Unmanaged.passUnretained(self).toOpaque()
 
@@ -296,6 +301,14 @@ final class KeyMonitor {
 
         if key == .customShortcut {
             return handleCustomCGEvent(type: type, event: event)
+        }
+
+        if key == .fn, type == .keyDown {
+            // Any other key going down while we're tracking Fn as held means
+            // the user is using Fn as a system modifier (Fn+Space, Fn+arrow, …),
+            // not talking to us. Never swallow it — just untrack our hold.
+            DispatchQueue.main.async { [weak self] in self?.onForeignKeyDownWhileFnHeld() }
+            return Unmanaged.passRetained(event)
         }
 
         // Fn path — suppress the key so the OS doesn't show the emoji picker.
@@ -489,6 +502,29 @@ final class KeyMonitor {
 
         case .idle, .waitingSecondTap, .holdReleasePending,
              .toggleRecording, .handsFreeRecording:
+            break
+        }
+    }
+
+    /// Fn-only: a keyDown for some other key arrived while we were still
+    /// deciding hold-vs-tap, waiting on a possible second tap, or already in a
+    /// hold recording. That combination (Fn + another key) means the physical
+    /// Fn press was never meant as our hotkey — reset so the eventual Fn keyUp
+    /// isn't misread, cancelling the hold session if one already started.
+    /// Toggle/hands-free sessions are left alone: by then the interaction has
+    /// already committed and the user may legitimately type while dictating.
+    private func onForeignKeyDownWhileFnHeld() {
+        switch state {
+        case .holdOrTapPending, .waitingSecondTap:
+            cancelAllTimers()
+            state = .idle
+            pressedAt = nil
+        case .holdRecording:
+            cancelAllTimers()
+            state = .idle
+            pressedAt = nil
+            onStop?()
+        default:
             break
         }
     }

@@ -181,6 +181,7 @@ final class AppSettings: ObservableObject {
         static let historyEnabled               = "historyEnabled"
         static let historyKeepAudio             = "historyKeepAudio"
         static let historyMaxSessions           = "historyMaxSessions"
+        static let historyMaxDiskMB             = "historyMaxDiskMB"
         /// Legacy key from the boolean-review era, read only by the one-time
         /// `reviewMode` migration below — never written again.
         static let reviewEnabled                = "reviewEnabled"
@@ -288,6 +289,7 @@ final class AppSettings: ObservableObject {
         if d.object(forKey: Key.historyEnabled) == nil        { d.set(true, forKey: Key.historyEnabled) }
         if d.object(forKey: Key.historyKeepAudio) == nil      { d.set(true, forKey: Key.historyKeepAudio) }
         if d.object(forKey: Key.historyMaxSessions) == nil    { d.set(200, forKey: Key.historyMaxSessions) }
+        if d.object(forKey: Key.historyMaxDiskMB) == nil      { d.set(500, forKey: Key.historyMaxDiskMB) }
         if d.object(forKey: Key.reviewMode) == nil {
             // One-time migration from the boolean era: `reviewEnabled == true`
             // used to mean "show the after-insert review box" — that IS what
@@ -734,6 +736,19 @@ final class AppSettings: ObservableObject {
         return 200
     }() {
         didSet { defaults.set(historyMaxSessions, forKey: Key.historyMaxSessions) }
+    }
+
+    /// Total on-disk audio budget in MB across all kept recordings — a
+    /// separate cap from `historyMaxSessions` (session count). No settings UI;
+    /// defaults-writable only (`defaults write com.zhijie.VoiceInput
+    /// historyMaxDiskMB <n>`).
+    @Published var historyMaxDiskMB: Int = {
+        if UserDefaults.standard.object(forKey: Key.historyMaxDiskMB) != nil {
+            return UserDefaults.standard.integer(forKey: Key.historyMaxDiskMB)
+        }
+        return 500
+    }() {
+        didSet { defaults.set(historyMaxDiskMB, forKey: Key.historyMaxDiskMB) }
     }
 
     // MARK: - Post-dictation review

@@ -1,5 +1,6 @@
 import AppKit
 import AVFoundation
+import Charts
 import SwiftUI
 
 // MARK: - HistoryView
@@ -15,7 +16,16 @@ struct HistoryView: View {
     @State private var searchText: String = ""
     @State private var showClearAllConfirm = false
 
-    @StateObject private var player = AudioPlayer()
+    // Correction-rate chart data — a plain snapshot pulled from
+    // `SessionStatsStore` (not itself observable), refreshed on first
+    // appearance and every time the window is brought forward.
+    @State private var dailyStats: [(day: Date, injected: Int, corrected: Int)] = []
+    @State private var weekStats: (injected: Int, corrected: Int) = (injected: 0, corrected: 0)
+
+    // Shared (not view-owned) so `HistoryWindowController` can stop playback
+    // from the window's `willClose` notification — see its comment for why
+    // `.onDisappear` below can't be relied on for that.
+    @StateObject private var player = AudioPlayer.shared
 
     private var filteredRecords: [HistoryRecord] {
         let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -34,6 +44,8 @@ struct HistoryView: View {
     var body: some View {
         VStack(spacing: 0) {
             header
+            Hairline()
+            SessionStatsHeader(dailyStats: dailyStats, weekStats: weekStats)
             Hairline()
             HStack(spacing: 0) {
                 sidebar
@@ -63,7 +75,20 @@ struct HistoryView: View {
             if selectedID == nil {
                 selectedID = filteredRecords.first?.id
             }
+            refreshSessionStats()
         }
+        .onReceive(NotificationCenter.default.publisher(for: .historyWindowDidShow)) { _ in
+            refreshSessionStats()
+        }
+    }
+
+    /// Pulls a fresh snapshot from `SessionStatsStore` — called on first
+    /// appearance and again on every `.historyWindowDidShow` (window reopen),
+    /// since the store itself isn't observable and the hosting view persists
+    /// across closes.
+    private func refreshSessionStats() {
+        dailyStats = SessionStatsStore.shared.dailyStats(days: 14)
+        weekStats = SessionStatsStore.shared.weekStats()
     }
 
     // MARK: In-content header
@@ -188,10 +213,16 @@ struct HistoryView: View {
 
     private var footerBar: some View {
         HStack(spacing: 10) {
-            Text(countLabel)
-                .font(.system(size: 11))
-                .foregroundStyle(Theme.textSecondary)
-                .lineLimit(1)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(countLabel)
+                    .font(.system(size: 11))
+                    .foregroundStyle(Theme.textSecondary)
+                    .lineLimit(1)
+                Text(audioUsageLabel)
+                    .font(.system(size: 10))
+                    .foregroundStyle(Theme.textSecondary.opacity(0.75))
+                    .lineLimit(1)
+            }
 
             Spacer(minLength: 6)
 
@@ -242,6 +273,12 @@ struct HistoryView: View {
         return count == 1 ? "1 session" : "\(count) sessions"
     }
 
+    /// "Audio: 213 MB" — `store.audioDiskUsageBytes` is recomputed by the
+    /// store itself on window-open and after a delete, never polled here.
+    private var audioUsageLabel: String {
+        "Audio: \(HistoryFormat.diskSize(store.audioDiskUsageBytes))"
+    }
+
     // MARK: Detail pane
 
     @ViewBuilder
@@ -285,6 +322,84 @@ struct HistoryView: View {
             selectedID = nextIndex >= 0 ? remaining[nextIndex].id : nil
         }
         store.delete([record.id])
+    }
+}
+
+// MARK: - SessionStatsHeader
+
+/// A compact 14-day correction-rate chart, spanning the window above the
+/// master-detail split: one bar per day for sessions whose text actually
+/// reached the target app, with the corrected count overlaid so the bar
+/// visibly "hollows out" as ASR quality improves. Headline is the rolling
+/// 7-day rate. Purely reactive — the two arrays are pulled snapshots handed
+/// down from `HistoryView`, never a live subscription.
+private struct SessionStatsHeader: View {
+    let dailyStats: [(day: Date, injected: Int, corrected: Int)]
+    let weekStats: (injected: Int, corrected: Int)
+
+    private var hasData: Bool {
+        dailyStats.contains { $0.injected > 0 || $0.corrected > 0 }
+    }
+
+    private var weekHeadline: String {
+        guard weekStats.injected > 0 else { return "This week: no dictations" }
+        let percent = Int((Double(weekStats.corrected) / Double(weekStats.injected) * 100).rounded())
+        return "This week: \(percent)% corrected"
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("Correction rate")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(Theme.textPrimary)
+                Spacer()
+                Text(weekHeadline)
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(Theme.textSecondary)
+            }
+
+            if hasData {
+                chart.frame(height: 52)
+            } else {
+                Text("No data yet — corrections you make in the review box will chart here.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(Theme.textSecondary)
+                    .frame(maxWidth: .infinity, minHeight: 52, alignment: .center)
+                    .multilineTextAlignment(.center)
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .frame(maxWidth: .infinity)
+        .background(Theme.chrome)
+    }
+
+    /// Two `.unstacked` bar marks per day sharing one x — the lighter
+    /// `injected` bar is the full session count for that day, the accent
+    /// `corrected` bar draws at the same baseline so it reads as a fill
+    /// level inside the bar rather than a second, stacked series.
+    private var chart: some View {
+        Chart(dailyStats, id: \.day) { entry in
+            BarMark(
+                x: .value("Day", entry.day, unit: .day),
+                y: .value("Sessions", entry.injected),
+                stacking: .unstacked
+            )
+            .foregroundStyle(Theme.pill)
+            .cornerRadius(2)
+
+            BarMark(
+                x: .value("Day", entry.day, unit: .day),
+                y: .value("Corrected", entry.corrected),
+                stacking: .unstacked
+            )
+            .foregroundStyle(Theme.accent)
+            .cornerRadius(2)
+        }
+        .chartXAxis(.hidden)
+        .chartYAxis(.hidden)
+        .chartLegend(.hidden)
     }
 }
 
@@ -576,6 +691,8 @@ private struct ProgressBar: View {
 /// timer so the transport stays in sync. Playback is stopped explicitly when the
 /// selection changes or the window closes.
 final class AudioPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
+    static let shared = AudioPlayer()
+
     @Published private(set) var currentTime: TimeInterval = 0
     @Published private(set) var playing = false
 
@@ -723,6 +840,12 @@ private enum HistoryFormat {
         return f
     }()
 
+    private static let byteFormatter: ByteCountFormatter = {
+        let f = ByteCountFormatter()
+        f.countStyle = .file
+        return f
+    }()
+
     /// "3 min ago", "yesterday", etc.
     static func relativeDate(_ date: Date) -> String {
         relativeFormatter.localizedString(for: date, relativeTo: Date())
@@ -731,6 +854,11 @@ private enum HistoryFormat {
     /// "Jun 11, 2026 at 2:14 PM"
     static func absoluteDate(_ date: Date) -> String {
         absoluteFormatter.string(from: date)
+    }
+
+    /// "213 MB", "1.2 GB", etc.
+    static func diskSize(_ bytes: Int64) -> String {
+        byteFormatter.string(fromByteCount: bytes)
     }
 
     /// Duration as "0:12" or "1:05:09".

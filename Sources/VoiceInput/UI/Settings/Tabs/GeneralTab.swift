@@ -31,7 +31,7 @@ struct GeneralTab: View {
 
                 InlineRow(
                     title: "Pause media while dictating",
-                    help: "Spotify and Apple Music are paused precisely via AppleScript. All other players (browsers, IINA, NetEase, etc.) are paused via the system Play/Pause key."
+                    help: "Spotify and Apple Music are paused via AppleScript, and only if they're already playing, so resume never starts something that wasn't running. Other players (browsers, IINA, NetEase, etc.) are not affected."
                 ) {
                     BlueToggle(isOn: $settings.mediaAutoPause)
                 }

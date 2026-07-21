@@ -202,6 +202,9 @@ final class DictationController {
                 audioWAV: pendingAudioWAV
             )
             pendingAudioWAV = nil
+            // The previous session's final resolution — flushed straight to
+            // injection with no review shown, so no correction is possible.
+            SessionStatsStore.shared.append(injected: true, corrected: false)
         }
 
         isActive = true
@@ -720,6 +723,9 @@ final class DictationController {
             if self.settings.reviewMode == .after && !trimmedText.isEmpty {
                 self.beginReviewAfterInsert(injectedText: text, raw: raw, backend: backend, historyID: recordID, generation: generation)
             } else {
+                // "off" mode (or the defensive empty-text fallback above):
+                // the session is fully resolved right here — one stat line.
+                SessionStatsStore.shared.append(injected: true, corrected: false)
                 self.overlayPanel.dismiss()
                 self.appState.phase = .idle
                 self.appState.transcript = TranscriptSnapshot()
@@ -759,6 +765,9 @@ final class DictationController {
         let seconds = max(0.5, settings.reviewSeconds)
         reviewTimer = Timer.scheduledTimer(withTimeInterval: seconds, repeats: false) { [weak self] _ in
             guard let self, self.sessionGeneration == generation else { return }
+            // Auto-dismiss with no edit made — already injected at review
+            // start, so this session resolves as "delivered, uncorrected".
+            SessionStatsStore.shared.append(injected: true, corrected: false)
             self.dismissReview()
         }
     }
@@ -909,6 +918,13 @@ final class DictationController {
                 injected: false,
                 audioWAV: reviewAudioWAV
             )
+            // "before" mode never injected — this session never delivered text.
+            SessionStatsStore.shared.append(injected: false, corrected: false)
+        } else if activeReviewMode == .after {
+            // "after" mode already injected + recorded to history when the
+            // review began; interrupting it here (Esc, a new session
+            // reclaiming the panel, app termination) is an uncorrected exit.
+            SessionStatsStore.shared.append(injected: true, corrected: false)
         }
         dismissReview()
     }
@@ -935,6 +951,7 @@ final class DictationController {
         let original = appState.reviewText
 
         guard corrected != original else {
+            SessionStatsStore.shared.append(injected: true, corrected: false)
             dismissReview()
             return
         }
@@ -952,6 +969,7 @@ final class DictationController {
 
         textInjector.replaceLastInjection(with: corrected)
 
+        SessionStatsStore.shared.append(injected: true, corrected: true)
         dismissReview()
     }
 
@@ -1014,6 +1032,8 @@ final class DictationController {
                 )
                 HistoryStore.shared.updateCorrection(id: recordID, corrected: corrected)
             }
+
+            SessionStatsStore.shared.append(injected: true, corrected: corrected != original)
         }
     }
 }

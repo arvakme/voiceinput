@@ -215,6 +215,7 @@ private final class ShortcutRecorderButton: NSButton {
     var onCapture: ((HotkeyShortcut) -> Void)?
 
     private var monitor: Any?
+    private var windowCloseObserver: NSObjectProtocol?
     private var isRecording = false
 
     override init(frame frameRect: NSRect) {
@@ -247,10 +248,27 @@ private final class ShortcutRecorderButton: NSButton {
             self.capture(event)
             return nil
         }
+        // The Settings window is reused (never deallocated), so if it's closed
+        // mid-recording nothing would otherwise stop this local monitor from
+        // swallowing every keyDown in the app forever. End recording when it closes.
+        if let window {
+            windowCloseObserver = NotificationCenter.default.addObserver(
+                forName: NSWindow.willCloseNotification,
+                object: window,
+                queue: .main
+            ) { [weak self] _ in
+                self?.endRecording()
+            }
+        }
     }
 
     override func keyDown(with event: NSEvent) {
         capture(event)
+    }
+
+    override func resignFirstResponder() -> Bool {
+        if isRecording { endRecording() }
+        return super.resignFirstResponder()
     }
 
     private func capture(_ event: NSEvent) {
@@ -280,10 +298,16 @@ private final class ShortcutRecorderButton: NSButton {
         endRecording()
     }
 
+    /// Idempotent — safe to call repeatedly (e.g. both windowWillClose and a
+    /// later resignFirstResponder for the same recording session).
     private func endRecording() {
         if let monitor {
             NSEvent.removeMonitor(monitor)
             self.monitor = nil
+        }
+        if let windowCloseObserver {
+            NotificationCenter.default.removeObserver(windowCloseObserver)
+            self.windowCloseObserver = nil
         }
         isRecording = false
         title = shortcut.displayString
@@ -292,6 +316,9 @@ private final class ShortcutRecorderButton: NSButton {
     deinit {
         if let monitor {
             NSEvent.removeMonitor(monitor)
+        }
+        if let windowCloseObserver {
+            NotificationCenter.default.removeObserver(windowCloseObserver)
         }
     }
 

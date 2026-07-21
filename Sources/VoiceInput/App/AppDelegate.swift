@@ -232,9 +232,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statusLine.isEnabled = false
         menu.addItem(statusLine)
 
-        // Corrections-this-week line (disabled; refreshed in menuNeedsUpdate
-        // every time the menu opens).
-        let correctionsItem = NSMenuItem(title: "Corrections this week: 0", action: nil, keyEquivalent: "")
+        // This-week correction-rate line (disabled; refreshed in
+        // menuNeedsUpdate every time the menu opens).
+        let correctionsItem = NSMenuItem(title: Self.weekStatsLabel(), action: nil, keyEquivalent: "")
         correctionsItem.isEnabled = false
         menu.addItem(correctionsItem)
         correctionsMenuItem = correctionsItem
@@ -304,7 +304,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: - NSMenuDelegate
 
     func menuNeedsUpdate(_ menu: NSMenu) {
-        correctionsMenuItem?.title = "Corrections this week: \(CorrectionStore.shared.countThisWeek())"
+        correctionsMenuItem?.title = Self.weekStatsLabel()
+    }
+
+    /// "This week: 3/25 corrected (12%)" — `injected` (sessions whose text
+    /// actually reached the target app) is the denominator; a "before"-mode
+    /// review the user declined to insert never counts toward either side.
+    /// "This week: no dictations" when nothing resolved in the trailing 7 days.
+    private static func weekStatsLabel() -> String {
+        let stats = SessionStatsStore.shared.weekStats()
+        guard stats.injected > 0 else { return "This week: no dictations" }
+        let percent = Int((Double(stats.corrected) / Double(stats.injected) * 100).rounded())
+        return "This week: \(stats.corrected)/\(stats.injected) corrected (\(percent)%)"
     }
 
     @objc private func toggleEnabled() {

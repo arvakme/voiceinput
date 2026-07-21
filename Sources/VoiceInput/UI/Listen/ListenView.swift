@@ -38,6 +38,27 @@ struct ListenView: View {
         .gesture(WindowDragGesture())
         .padding(40)
         .animation(.spring(duration: 0.3), value: state.errorMessage)
+        .animation(.spring(duration: 0.3), value: state.reconnecting)
+    }
+
+    // MARK: - Status note (error / quiet reconnecting)
+
+    /// A terminal error is shown in red; an auto-reconnect in progress (network
+    /// blip, provider session-length cap) is shown as a quiet, non-alarming
+    /// note instead — it isn't something the user needs to act on.
+    @ViewBuilder
+    private func statusText(fontSize: CGFloat) -> some View {
+        if state.reconnecting {
+            Text("Reconnecting…")
+                .font(.system(size: fontSize))
+                .foregroundStyle(Theme.textSecondary.opacity(0.8))
+                .lineLimit(1)
+        } else if let error = state.errorMessage {
+            Text(error)
+                .font(.system(size: fontSize))
+                .foregroundStyle(Color.red.opacity(0.9))
+                .lineLimit(1).truncationMode(.middle)
+        }
     }
 
     // MARK: - Dual layout
@@ -80,12 +101,7 @@ struct ListenView: View {
                 ListenPulseDot(active: state.active, connecting: state.connecting)
                 targetMenu
                 providerMenu
-                if let error = state.errorMessage {
-                    Text(error)
-                        .font(.system(size: 10.5))
-                        .foregroundStyle(Color.red.opacity(0.9))
-                        .lineLimit(1).truncationMode(.middle)
-                }
+                statusText(fontSize: 10.5)
                 Spacer(minLength: 8)
                 sourceMenu
                 ListenIconButton(systemName: "rectangle.split.2x1", help: "Two-column view (Fn+Shift+Space)") {
@@ -96,7 +112,7 @@ struct ListenView: View {
 
             // Small original line.
             if !state.original.isEmpty {
-                singleLineTail(state.original.combined)
+                singleLineTail(state.original)
                     .font(.system(size: 12.5, weight: .medium))
                     .foregroundStyle(Theme.textSecondary.opacity(0.75))
                     .lineLimit(1)
@@ -131,16 +147,11 @@ struct ListenView: View {
             providerMenu
             sourceMenu
 
-            if let error = state.errorMessage {
-                Text(error)
-                    .font(.system(size: 11))
-                    .foregroundStyle(Color.red.opacity(0.9))
-                    .lineLimit(1).truncationMode(.middle)
-            }
+            statusText(fontSize: 11)
 
             Spacer(minLength: 12)
 
-            MiniWaveform(level: state.audioLevel)
+            MiniWaveform(audioLevel: state.audioLevel)
                 .frame(width: 60, height: 16)
 
             ListenIconButton(systemName: "rectangle.compress.vertical", help: "Caption bar view (Fn+Shift+Space)") {
@@ -268,8 +279,25 @@ struct ListenView: View {
         }
     }
 
+    /// Displayed text is capped to a tail window so a hours-long session
+    /// doesn't rebuild an ever-growing AttributedString on every token — the
+    /// full text still accumulates in the session/controller for carry-over
+    /// across restarts, only rendering is windowed.
+    private static let displayWindowChars = 5_000
+
+    /// Last `displayWindowChars` characters of `text`, advanced forward to
+    /// the next line boundary so the visible window doesn't open mid-line.
+    private func windowedTail(_ text: String) -> Substring {
+        guard text.count > Self.displayWindowChars else { return text[...] }
+        let cut = text.index(text.endIndex, offsetBy: -Self.displayWindowChars)
+        if let newline = text[cut...].firstIndex(of: "\n") {
+            return text[text.index(after: newline)...]
+        }
+        return text[cut...]
+    }
+
     private func columnText(_ snapshot: TranscriptSnapshot, fontSize: CGFloat, weight: Font.Weight) -> Text {
-        var attributed = AttributedString(snapshot.finalText)
+        var attributed = AttributedString(String(windowedTail(snapshot.finalText)))
         attributed.foregroundColor = Theme.textPrimary
         var interim = AttributedString(snapshot.interimText)
         interim.foregroundColor = Theme.textSecondary.opacity(0.6)
@@ -277,9 +305,11 @@ struct ListenView: View {
         return Text(attributed).font(.system(size: fontSize, weight: weight))
     }
 
-    /// Last ~80 chars of a combined transcript, for the bar's small original line.
-    private func singleLineTail(_ text: String) -> Text {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    /// Last ~80 chars of a transcript, for the bar's small original line —
+    /// computed from the tail window (bounded), never the full string.
+    private func singleLineTail(_ snapshot: TranscriptSnapshot) -> Text {
+        let windowed = String(windowedTail(snapshot.finalText)) + snapshot.interimText
+        let trimmed = windowed.trimmingCharacters(in: .whitespacesAndNewlines)
         let tail = trimmed.count > 90 ? String(trimmed.suffix(90)) : trimmed
         return Text(tail)
     }
@@ -430,19 +460,21 @@ private struct ListenPulseDot: View {
 }
 
 private struct MiniWaveform: View {
-    let level: Float
+    // Observed here ONLY — level updates arrive up to ~100 Hz and must not
+    // bubble up into ListenView's body (see `ListenState.audioLevel`).
+    @ObservedObject var audioLevel: ListenAudioLevel
     var body: some View {
         HStack(spacing: 2.5) {
             ForEach(0..<9, id: \.self) { index in
                 Capsule().fill(Theme.accent.opacity(0.85)).frame(width: 2.5, height: barHeight(index))
             }
         }
-        .animation(.easeOut(duration: 0.12), value: level)
+        .animation(.easeOut(duration: 0.12), value: audioLevel.level)
         .accessibilityHidden(true)
     }
     private func barHeight(_ index: Int) -> CGFloat {
         let envelope = sin(Double(index + 1) / 10.0 * .pi)
-        return 3 + CGFloat(Double(level) * envelope) * 13
+        return 3 + CGFloat(Double(audioLevel.level) * envelope) * 13
     }
 }
 

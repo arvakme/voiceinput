@@ -10,8 +10,20 @@ final class ListenState: ObservableObject {
     @Published var connecting = false
     @Published var original = TranscriptSnapshot()
     @Published var translation = TranscriptSnapshot()
-    @Published var audioLevel: Float = 0
     @Published var errorMessage: String?
+    /// True while auto-reconnecting after a recoverable error (network blip,
+    /// provider session-length cap) — shown as a quiet note, not a red error.
+    @Published var reconnecting = false
+    /// NOT `@Published`: level updates arrive up to ~100 Hz, so only the tiny
+    /// MiniWaveform view observes this object directly — publishing it here
+    /// would re-evaluate the whole panel body on every tick.
+    let audioLevel = ListenAudioLevel()
+}
+
+/// Isolated audio-level publisher observed only by `MiniWaveform`. See
+/// `ListenState.audioLevel`.
+final class ListenAudioLevel: ObservableObject {
+    @Published var level: Float = 0
 }
 
 // MARK: - ListenController
@@ -36,6 +48,20 @@ final class ListenController {
     /// Text carried across target-language restarts.
     private var carriedOriginal = ""
     private var carriedTranslation = ""
+
+    /// Auto-reconnect bookkeeping for recoverable session errors. Reset to 0
+    /// on every successful connect or user-driven restart; exhausted after
+    /// `maxReconnectAttempts` consecutive failures, at which point the error
+    /// becomes terminal (see `enterTerminalError`).
+    private var reconnectAttempt = 0
+    private var reconnectWorkItem: DispatchWorkItem?
+    private let maxReconnectAttempts = 3
+    private let reconnectDelays: [TimeInterval] = [1, 2, 4]
+
+    /// Throttles `ListenAudioLevel.level` publishes to ≤20 Hz (see fix for
+    /// the redraw storm at capture-callback rate, ~100 Hz for system audio).
+    private var lastLevelUpdate: TimeInterval = 0
+    private let levelUpdateInterval: TimeInterval = 0.05
 
     private var cancellables = Set<AnyCancellable>()
 
@@ -88,6 +114,7 @@ final class ListenController {
         state.translation = TranscriptSnapshot()
         carriedOriginal = ""
         carriedTranslation = ""
+        cancelPendingReconnect()
 
         if panel == nil { panel = ListenPanel(state: state, settings: settings, controller: self) }
         panel?.show()
@@ -100,6 +127,7 @@ final class ListenController {
         guard state.active else { return }
         Log.app.info("Live Captions stop")
         state.active = false
+        cancelPendingReconnect()
         stopCapture()
         session?.stop()
         session = nil
@@ -121,7 +149,10 @@ final class ListenController {
         session = newSession
 
         newSession.onConnected = { [weak self] in
-            self?.state.connecting = false
+            guard let self else { return }
+            self.state.connecting = false
+            self.state.reconnecting = false
+            self.reconnectAttempt = 0
         }
         newSession.onOriginal = { [weak self] snapshot in
             guard let self, self.state.active else { return }
@@ -137,17 +168,25 @@ final class ListenController {
                 interimText: snapshot.interimText
             )
         }
-        newSession.onError = { [weak self] message in
+        newSession.onError = { [weak self] error in
             guard let self, self.state.active else { return }
-            self.state.errorMessage = message
-            self.state.connecting = false
+            switch error {
+            case .terminal(let message):
+                self.enterTerminalError(message)
+            case .recoverable(let message):
+                self.scheduleReconnect(afterError: message)
+            }
         }
 
         newSession.start(settings: settings)
     }
 
-    private func restartSessionCarryingText(carry: Bool = true) {
+    /// Restarts the session carrying the text shown so far. Used both for
+    /// user-driven restarts (target-language/provider change, clear) and —
+    /// with `resetReconnect: false` — by the auto-reconnect backoff below.
+    private func restartSessionCarryingText(carry: Bool = true, resetReconnect: Bool = true) {
         guard state.active else { return }
+        if resetReconnect { cancelPendingReconnect() }
         if carry {
             carriedOriginal = state.original.combined
             carriedTranslation = state.translation.combined
@@ -158,6 +197,55 @@ final class ListenController {
         startSession()
     }
 
+    /// A recoverable error (network blip, Soniox's 300-minute session cap):
+    /// retry with exponential backoff, carrying the transcript so far. After
+    /// `maxReconnectAttempts` consecutive failures, give up and go terminal —
+    /// endless silent retries would just burn CPU against a dead network.
+    private func scheduleReconnect(afterError message: String) {
+        guard state.active else { return }
+        session?.stop()
+        session = nil
+        reconnectAttempt += 1
+        guard reconnectAttempt <= maxReconnectAttempts else {
+            enterTerminalError(message)
+            return
+        }
+        state.reconnecting = true
+        state.connecting = true
+        state.errorMessage = nil
+
+        let attempt = reconnectAttempt
+        let delay = reconnectDelays[attempt - 1]
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self, self.state.active, self.reconnectAttempt == attempt else { return }
+            self.restartSessionCarryingText(resetReconnect: false)
+        }
+        reconnectWorkItem?.cancel()
+        reconnectWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
+    }
+
+    /// Auth/config errors (bad key, bad request) recur identically on retry —
+    /// show the error and release the mic/system capture instead of leaving
+    /// them running (privacy light on, CPU burning) against a session that
+    /// can never succeed. The panel stays up so the transcript and error
+    /// remain visible; only an explicit stop dismisses it.
+    private func enterTerminalError(_ message: String) {
+        cancelPendingReconnect()
+        state.connecting = false
+        state.errorMessage = message
+        session?.stop()
+        session = nil
+        stopCapture()
+    }
+
+    private func cancelPendingReconnect() {
+        reconnectWorkItem?.cancel()
+        reconnectWorkItem = nil
+        reconnectAttempt = 0
+        state.reconnecting = false
+    }
+
     // MARK: - Capture
 
     private func startCapture() {
@@ -165,20 +253,20 @@ final class ListenController {
             let capture = AudioCapture()
             micCapture = capture
             capture.onChunk = { [weak self] chunk in self?.session?.sendAudio(chunk) }
-            capture.onLevel = { [weak self] level in self?.state.audioLevel = level }
+            capture.onLevel = { [weak self] level in self?.handleAudioLevel(level) }
             do {
                 try capture.start()
             } catch {
-                state.errorMessage = "Microphone capture failed: \(error.localizedDescription)"
+                enterTerminalError("Microphone capture failed: \(error.localizedDescription)")
             }
         } else {
             let capture = SystemAudioCapture()
             systemCapture = capture
             capture.onChunk = { [weak self] chunk in self?.session?.sendAudio(chunk) }
-            capture.onLevel = { [weak self] level in self?.state.audioLevel = level }
+            capture.onLevel = { [weak self] level in self?.handleAudioLevel(level) }
             capture.onError = { [weak self] message in
                 guard let self, self.state.active else { return }
-                self.state.errorMessage = message
+                self.enterTerminalError(message)
             }
             capture.start()
         }
@@ -189,7 +277,18 @@ final class ListenController {
         micCapture = nil
         systemCapture?.stop()
         systemCapture = nil
-        state.audioLevel = 0
+        state.audioLevel.level = 0
+    }
+
+    /// Throttled to ≤20 Hz and dropped entirely in bar layout, where
+    /// MiniWaveform isn't shown — no point publishing at capture rate (up to
+    /// ~100 Hz for system audio) into a view nobody's looking at.
+    private func handleAudioLevel(_ level: Float) {
+        guard settings.listenMode != "bar" else { return }
+        let now = Date().timeIntervalSinceReferenceDate
+        guard now - lastLevelUpdate >= levelUpdateInterval else { return }
+        lastLevelUpdate = now
+        state.audioLevel.level = level
     }
 
     private func restartCapture() {

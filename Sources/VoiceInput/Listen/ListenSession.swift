@@ -14,7 +14,7 @@ final class SonioxListenSession: LiveCaptionSession {
     var onOriginal: ((TranscriptSnapshot) -> Void)?
     var onTranslation: ((TranscriptSnapshot) -> Void)?
     var onConnected: (() -> Void)?
-    var onError: ((String) -> Void)?
+    var onError: ((LiveCaptionError) -> Void)?
 
     private let queue = DispatchQueue(label: "VoiceInput.ListenWS")
     private var ws: URLSessionWebSocketTask?
@@ -39,7 +39,9 @@ final class SonioxListenSession: LiveCaptionSession {
         let gen = currentGeneration()
 
         guard !apiKey.isEmpty else {
-            DispatchQueue.main.async { self.onError?("Soniox API key not configured (Settings → Providers → Live Captions).") }
+            DispatchQueue.main.async {
+                self.onError?(.terminal("Soniox API key not configured (Settings → Providers → Live Captions)."))
+            }
             return
         }
         guard let url = URL(string: "wss://stt-rt.soniox.com/transcribe-websocket") else { return }
@@ -70,7 +72,7 @@ final class SonioxListenSession: LiveCaptionSession {
                let json = String(data: data, encoding: .utf8) {
                 task.send(.string(json)) { [weak self] error in
                     if let error {
-                        self?.reportError("Listen connect failed: \(error.localizedDescription)", gen: gen)
+                        self?.reportError(.recoverable("Listen connect failed: \(error.localizedDescription)"), gen: gen)
                     } else {
                         DispatchQueue.main.async { [weak self] in
                             guard let self, self.isCurrent(gen) else { return }
@@ -110,23 +112,29 @@ final class SonioxListenSession: LiveCaptionSession {
                 case .failure(let error):
                     let nsError = error as NSError
                     if nsError.code == NSURLErrorCancelled { return }
-                    self.reportError("Listen stream error: \(error.localizedDescription)", gen: gen)
+                    self.reportError(.recoverable("Listen stream error: \(error.localizedDescription)"), gen: gen)
                 case .success(let message):
                     if case let .string(text) = message,
                        let data = text.data(using: .utf8),
                        let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
                         if let code = json["error_code"] as? Int {
                             let msg = json["error_message"] as? String ?? "error \(code)"
-                            self.reportError("Soniox: \(msg)", gen: gen)
+                            // error_code mirrors HTTP: 400/401/402/403 are auth
+                            // or config problems that will recur identically on
+                            // retry; 408/429/5xx are transient and worth a retry.
+                            let isTerminal = [400, 401, 402, 403].contains(code)
+                            let captionError: LiveCaptionError = isTerminal
+                                ? .terminal("Soniox: \(msg)") : .recoverable("Soniox: \(msg)")
+                            self.reportError(captionError, gen: gen)
                             return
                         }
                         self.handleTokensOnQueue(json, gen: gen)
                         if json["finished"] as? Bool == true {
                             // Server closed the realtime session (e.g. the
                             // 300-minute cap). In continuous captions we never
-                            // send an end frame, so surface it rather than
-                            // freezing silently.
-                            self.reportError("Caption stream ended — press Fn+Space to resume.", gen: gen)
+                            // send an end frame, so this is expected eventually —
+                            // reconnect rather than freeze silently.
+                            self.reportError(.recoverable("Caption session limit reached."), gen: gen)
                             return
                         }
                     }
@@ -179,13 +187,13 @@ final class SonioxListenSession: LiveCaptionSession {
 
     // MARK: - Helpers
 
-    private func reportError(_ message: String, gen: UInt64) {
+    private func reportError(_ error: LiveCaptionError, gen: UInt64) {
         queue.async { [weak self] in
             guard let self, self.isCurrent(gen) else { return }
             self.closeOnQueue()
             DispatchQueue.main.async { [weak self] in
                 guard let self, self.isCurrent(gen) else { return }
-                self.onError?(message)
+                self.onError?(error)
             }
         }
     }

@@ -47,11 +47,40 @@ final class HistoryStore: ObservableObject {
     /// Newest first. Mutated only on the main thread.
     @Published private(set) var records: [HistoryRecord] = []
 
+    /// Sum of on-disk audio file bytes across all current records. Recomputed
+    /// explicitly (window open, after a delete) — never polled.
+    @Published private(set) var audioDiskUsageBytes: Int64 = 0
+
     private let io = DispatchQueue(label: "com.zhijie.VoiceInput.history.io", qos: .utility)
     private let fileManager = FileManager.default
+    private var cancellables = Set<AnyCancellable>()
 
     private init() {
         loadInitial()
+        observeSettings()
+    }
+
+    /// `historyMaxSessions` normally only prunes on the next `record()` call;
+    /// this makes a shrunk cap take effect immediately. `historyMaxDiskMB` is
+    /// read here (on whatever thread the setting publishes on — main, per the
+    /// settings-mutation invariant) rather than inside the `io`-scheduled
+    /// closure, so no AppSettings property is ever touched off-main.
+    private func observeSettings() {
+        AppSettings.shared.$historyMaxSessions
+            .removeDuplicates()
+            .dropFirst()
+            .map { newMax in (max(0, newMax), Int64(max(0, AppSettings.shared.historyMaxDiskMB)) * 1_048_576) }
+            .receive(on: io)
+            .sink { [weak self] maxSessions, maxDiskBytes in
+                guard let self else { return }
+                let current = self.readRecordsFromDisk()
+                let pruned = self.applyRetentionLimits(to: current, maxSessions: maxSessions, maxDiskBytes: maxDiskBytes)
+                self.writeRecordsToDisk(pruned)
+                DispatchQueue.main.async {
+                    self.records = pruned
+                }
+            }
+            .store(in: &cancellables)
     }
 
     /// Blocks the calling thread until every write enqueued so far has hit
@@ -110,15 +139,46 @@ final class HistoryStore: ObservableObject {
 
     // MARK: - Loading
 
-    /// Loads `history.json` lazily at init on the background queue, then
-    /// publishes the parsed records on the main thread.
+    /// Loads `history.json` lazily at init on the background queue, sweeps any
+    /// orphaned audio files, then publishes the parsed records on the main thread.
     private func loadInitial() {
         io.async { [weak self] in
             guard let self else { return }
             let loaded = self.readRecordsFromDisk()
+            self.sweepOrphanedAudioFiles(referencedBy: loaded)
+            let usage = self.totalAudioBytes(loaded)
             DispatchQueue.main.async {
                 self.records = loaded
+                self.audioDiskUsageBytes = usage
             }
+        }
+    }
+
+    /// Deletes any file under `audio/` that isn't referenced by any record's
+    /// `audioFilename` — leftovers from a crash between writing the WAV and
+    /// persisting `history.json`, or from a write that failed partway through.
+    /// Must run on `io`.
+    private func sweepOrphanedAudioFiles(referencedBy records: [HistoryRecord]) {
+        guard fileManager.fileExists(atPath: audioDirectory.path) else { return }
+        let referenced = Set(records.compactMap(\.audioFilename))
+        let contents: [URL]
+        do {
+            contents = try fileManager.contentsOfDirectory(at: audioDirectory, includingPropertiesForKeys: nil)
+        } catch {
+            Log.app.error("History: failed to list audio directory: \(error.localizedDescription, privacy: .public)")
+            return
+        }
+        var removedCount = 0
+        for url in contents where !referenced.contains(url.lastPathComponent) {
+            do {
+                try fileManager.removeItem(at: url)
+                removedCount += 1
+            } catch {
+                Log.app.error("History: failed to delete orphaned audio \(url.lastPathComponent, privacy: .public): \(error.localizedDescription, privacy: .public)")
+            }
+        }
+        if removedCount > 0 {
+            Log.app.info("History: swept \(removedCount) orphaned audio file(s)")
         }
     }
 
@@ -144,8 +204,10 @@ final class HistoryStore: ObservableObject {
     ///
     /// Respects `AppSettings.shared.historyEnabled` (skips entirely when off)
     /// and `historyKeepAudio` (drops the audio when off). After insertion the
-    /// list is pruned to `historyMaxSessions`, deleting the audio files of any
-    /// records that fall off the end.
+    /// list is pruned to `historyMaxSessions` (deleting the audio files of any
+    /// records that fall off the end), then to `historyMaxDiskMB` (deleting
+    /// audio oldest-first, keeping the text record, until the total is back
+    /// under budget).
     ///
     /// Safe to call from any thread. Returns the new record's id immediately
     /// (even though the write itself completes asynchronously) so callers can
@@ -163,6 +225,7 @@ final class HistoryStore: ObservableObject {
 
         let keepAudio = settings.historyKeepAudio
         let maxSessions = max(0, settings.historyMaxSessions)
+        let maxDiskBytes = Int64(max(0, settings.historyMaxDiskMB)) * 1_048_576
 
         // A zero cap means "keep nothing": short-circuit before doing any audio
         // write or disk work so we never pay for a pointless write-then-delete.
@@ -214,14 +277,7 @@ final class HistoryStore: ObservableObject {
             current.insert(effectiveRecord, at: 0)
             current.sort { $0.date > $1.date }
 
-            var pruned = current
-            if pruned.count > maxSessions {
-                let overflow = Array(pruned[maxSessions...])
-                pruned = Array(pruned[0..<maxSessions])
-                for record in overflow {
-                    self.deleteAudioFile(for: record)
-                }
-            }
+            let pruned = self.applyRetentionLimits(to: current, maxSessions: maxSessions, maxDiskBytes: maxDiskBytes)
 
             self.writeRecordsToDisk(pruned)
 
@@ -268,6 +324,7 @@ final class HistoryStore: ObservableObject {
     // MARK: - Deletion
 
     /// Delete the records with the given ids, including their audio files.
+    /// Also refreshes `audioDiskUsageBytes` (one of its two update triggers).
     func delete(_ ids: Set<UUID>) {
         guard !ids.isEmpty else { return }
         io.async { [weak self] in
@@ -280,8 +337,10 @@ final class HistoryStore: ObservableObject {
             current.removeAll { ids.contains($0.id) }
             self.writeRecordsToDisk(current)
 
+            let usage = self.totalAudioBytes(current)
             DispatchQueue.main.async {
                 self.records = current
+                self.audioDiskUsageBytes = usage
             }
         }
     }
@@ -298,8 +357,78 @@ final class HistoryStore: ObservableObject {
 
             DispatchQueue.main.async {
                 self.records = []
+                self.audioDiskUsageBytes = 0
             }
         }
+    }
+
+    // MARK: - Retention
+
+    /// Recomputes `audioDiskUsageBytes` from disk. Call when the History
+    /// window is brought forward (its other update trigger is `delete`) —
+    /// there is no continuous polling.
+    func refreshAudioDiskUsage() {
+        io.async { [weak self] in
+            guard let self else { return }
+            let usage = self.totalAudioBytes(self.readRecordsFromDisk())
+            DispatchQueue.main.async {
+                self.audioDiskUsageBytes = usage
+            }
+        }
+    }
+
+    /// Applies the session-count and total-disk-size caps to `records`
+    /// (already newest-first): count overflow drops the whole record (text +
+    /// audio); disk overflow deletes only the audio file, oldest-first,
+    /// keeping the text record (`audioFilename` → nil). Must run on `io`.
+    private func applyRetentionLimits(to records: [HistoryRecord], maxSessions: Int, maxDiskBytes: Int64) -> [HistoryRecord] {
+        var pruned = records
+        if pruned.count > maxSessions {
+            let overflow = Array(pruned[maxSessions...])
+            pruned = Array(pruned[0..<maxSessions])
+            for record in overflow {
+                deleteAudioFile(for: record)
+            }
+        }
+
+        var totalBytes = totalAudioBytes(pruned)
+        guard totalBytes > maxDiskBytes else { return pruned }
+
+        // `pruned` is newest-first, so walk from the end (oldest) forward,
+        // dropping audio until back under budget.
+        for index in stride(from: pruned.count - 1, through: 0, by: -1) {
+            if totalBytes <= maxDiskBytes { break }
+            let record = pruned[index]
+            guard record.audioFilename != nil else { continue }
+            totalBytes -= audioFileSize(for: record)
+            deleteAudioFile(for: record)
+            pruned[index] = HistoryRecord(
+                id: record.id,
+                date: record.date,
+                durationSeconds: record.durationSeconds,
+                backend: record.backend,
+                rawTranscript: record.rawTranscript,
+                refinedTranscript: record.refinedTranscript,
+                injected: record.injected,
+                audioFilename: nil,
+                correctedTranscript: record.correctedTranscript
+            )
+        }
+        return pruned
+    }
+
+    /// Sum of on-disk audio file sizes for `records` (0 for records with no
+    /// audio, or whose file is missing). Must run on `io`.
+    private func totalAudioBytes(_ records: [HistoryRecord]) -> Int64 {
+        records.reduce(Int64(0)) { $0 + audioFileSize(for: $1) }
+    }
+
+    private func audioFileSize(for record: HistoryRecord) -> Int64 {
+        guard let filename = record.audioFilename, !filename.isEmpty else { return 0 }
+        let url = audioDirectory.appendingPathComponent(filename, isDirectory: false)
+        guard let attributes = try? fileManager.attributesOfItem(atPath: url.path),
+              let size = attributes[.size] as? Int64 else { return 0 }
+        return size
     }
 
     // MARK: - Disk helpers (background queue only)

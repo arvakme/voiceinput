@@ -14,8 +14,9 @@ protocol LiveCaptionSession: AnyObject {
     var onTranslation: ((TranscriptSnapshot) -> Void)? { get set }
     /// Fired once the stream is live and ready for audio.
     var onConnected: (() -> Void)? { get set }
-    /// Non-recoverable error (auth, network, quota).
-    var onError: ((String) -> Void)? { get set }
+    /// The stream ended — classified so the caller knows whether retrying is
+    /// worthwhile (`recoverable`) or futile (`terminal`).
+    var onError: ((LiveCaptionError) -> Void)? { get set }
 
     /// Open the stream using the current settings (target language, model, keys).
     func start(settings: AppSettings)
@@ -23,6 +24,17 @@ protocol LiveCaptionSession: AnyObject {
     func sendAudio(_ data: Data)
     /// Tear down; no further callbacks.
     func stop()
+}
+
+// MARK: - Error classification
+
+/// Distinguishes failures worth an automatic reconnect (network blips, the
+/// provider's own session-length cap) from ones that will just recur on retry
+/// (bad key, bad config, quota) — those must stop capture instead of
+/// spinning forever against a session that can never succeed.
+enum LiveCaptionError {
+    case recoverable(String)
+    case terminal(String)
 }
 
 // MARK: - Factory

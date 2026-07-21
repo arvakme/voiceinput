@@ -47,6 +47,10 @@ final class SonioxRealtimeSession: TranscriptionSession {
     /// Soniox allows 500–3000 (default 2000); lower = snappier hands-free stop,
     /// safe for dictation since finals are append-only regardless of when it fires.
     private static let maxEndpointDelayMs = 1000
+    /// Mid-session reconnect on a dead receive loop (e.g. Wi-Fi blip): 2 tries
+    /// per session, backing off 500ms then 2s. Index == attempt number - 1.
+    private static let maxReconnectAttempts = 2
+    private static let reconnectBackoffs: [TimeInterval] = [0.5, 2.0]
 
     // MARK: - Private state
 
@@ -67,6 +71,9 @@ final class SonioxRealtimeSession: TranscriptionSession {
     private var reportedError = false
     private var isFinalized = false
     private var stopCompletion: ((String) -> Void)?
+    /// Reset only in `openWebSocket` (called once, from `start()`) — a session
+    /// gets at most `maxReconnectAttempts` reconnects total, not per-outage.
+    private var reconnectAttempts = 0
 
     // Keepalive timer (main thread).
     private var keepaliveTimer: Timer?
@@ -170,6 +177,7 @@ final class SonioxRealtimeSession: TranscriptionSession {
             self.currentInterims = []
             self.reportedError = false
             self.isFinalized = false
+            self.reconnectAttempts = 0
 
             task.resume()
             self.sendConfigFrameOnQueue()
@@ -214,6 +222,44 @@ final class SonioxRealtimeSession: TranscriptionSession {
         Log.asr.debug("SonioxRealtimeSession: sent config frame")
     }
 
+    // MARK: - Reconnection
+
+    /// Runs on `wsQueue`. The dead socket is torn down immediately; the fresh
+    /// one is opened after a backoff so a transient blip gets a moment to clear.
+    private func beginReconnect(gen: UInt64) {
+        reconnectAttempts += 1
+        let attempt = reconnectAttempts
+        let delay = SonioxRealtimeSession.reconnectBackoffs[attempt - 1]
+        Log.asr.warning("SonioxRealtimeSession: receive failed, reconnect attempt \(attempt)/\(SonioxRealtimeSession.maxReconnectAttempts) in \(delay)s, gen=\(gen)")
+
+        // Server re-sends non-finals wholesale on the new socket; accumulatedFinals
+        // is append-only and is left untouched.
+        currentInterims = []
+        tearDownWebSocketOnQueue()
+
+        wsQueue.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self else { return }
+            // stop()/cancel() may have landed during the backoff window: a stale
+            // generation means cancel() won; isFinalized means stop() won and its
+            // own finalize-timeout fallback (already scheduled) delivers the text.
+            guard self.isCurrentGen(gen), !self.isFinalized else { return }
+            self.reconnectWebSocketOnQueue(gen: gen)
+        }
+    }
+
+    /// Runs on `wsQueue`. Re-opens with the same config and re-arms keepalive.
+    private func reconnectWebSocketOnQueue(gen: UInt64) {
+        let task = URLSession.shared.webSocketTask(with: SonioxRealtimeSession.websocketURL)
+        wsTask = task
+        reportedError = false
+
+        task.resume()
+        sendConfigFrameOnQueue()
+        receiveLoop(task: task, gen: gen)
+        startKeepalive(gen: gen)
+        Log.asr.info("SonioxRealtimeSession: reconnected, gen=\(gen)")
+    }
+
     // MARK: - Receive loop
 
     private func receiveLoop(task: URLSessionWebSocketTask, gen: UInt64) {
@@ -233,7 +279,18 @@ final class SonioxRealtimeSession: TranscriptionSession {
                     if nsErr.code == NSURLErrorCancelled { return }
                     let msg = "WebSocket receive error: \(error.localizedDescription)"
                     Log.asr.error("SonioxRealtimeSession: \(msg)")
-                    // Preserve accumulated finals; report error but don't clear state.
+
+                    // Mid-session drop, not finalizing yet, retries left: reconnect
+                    // silently — the user is still talking, don't surface onError.
+                    if !self.isFinalized && self.reconnectAttempts < SonioxRealtimeSession.maxReconnectAttempts {
+                        self.beginReconnect(gen: gen)
+                        return
+                    }
+
+                    // Finalizing, or reconnects exhausted: today's terminal-failure
+                    // behavior — preserve accumulated finals, report once, and if a
+                    // stop() is awaiting finalization deliver its text now instead of
+                    // waiting out the full finalize timeout.
                     if !self.reportedError {
                         self.reportedError = true
                         DispatchQueue.main.async { [weak self] in
@@ -241,9 +298,6 @@ final class SonioxRealtimeSession: TranscriptionSession {
                             self.onError?(msg)
                         }
                     }
-                    // The socket is dead — no "finished" frame will ever arrive.
-                    // If a stop() is awaiting finalization, deliver the accumulated
-                    // finals now instead of waiting out the full 3 s timeout.
                     if let cb = self.stopCompletion {
                         self.stopCompletion = nil
                         let text = self.buildFinalText()

@@ -1,4 +1,5 @@
 import AppKit
+import ApplicationServices
 import os.log
 
 /// Global Fn+Space hotkey toggling Live Captions.
@@ -16,6 +17,11 @@ final class ListenHotkey {
     private var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
     private var globalMonitor: Any?
+    private var activationObserver: NSObjectProtocol?
+
+    /// True once we've fallen back to the NSEvent global monitor because the
+    /// event tap couldn't be created (no Accessibility yet).
+    private var usingFallback = false
 
     private static let spaceKeyCode: Int64 = 49
 
@@ -66,6 +72,7 @@ final class ListenHotkey {
             runLoopSource = source
             CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
             CGEvent.tapEnable(tap: tap, enable: true)
+            usingFallback = false
             Log.keys.info("ListenHotkey tap installed (Fn+Space)")
         } else {
             // Accessibility not granted (yet): observe-only fallback.
@@ -80,8 +87,31 @@ final class ListenHotkey {
                     self?.onToggle?()
                 }
             }
+            usingFallback = true
             Log.keys.warning("ListenHotkey using NSEvent fallback (no event tap)")
         }
+
+        // While on the fallback, re-attempt the event tap whenever the app
+        // becomes active — covers the user granting Accessibility in System
+        // Settings and switching back without having to relaunch. Installed
+        // once and left in place across start()/stop() cycles.
+        if activationObserver == nil {
+            activationObserver = NotificationCenter.default.addObserver(
+                forName: NSApplication.didBecomeActiveNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                self?.retryEventTapIfNowTrusted()
+            }
+        }
+    }
+
+    /// Called on app activation; upgrades from the NSEvent fallback to the
+    /// event tap once Accessibility has actually become trusted.
+    private func retryEventTapIfNowTrusted() {
+        guard usingFallback, AXIsProcessTrusted() else { return }
+        Log.keys.info("ListenHotkey: Accessibility now trusted — retrying event tap")
+        start()
     }
 
     func stop() {

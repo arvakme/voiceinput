@@ -7,6 +7,8 @@ import SwiftUI
 final class SettingsWindowController {
     static let shared = SettingsWindowController()
 
+    private static let frameAutosaveName = "VoiceInputSettingsWindow"
+
     private var window: NSWindow?
     private var activationObserver: NSObjectProtocol?
 
@@ -23,10 +25,15 @@ final class SettingsWindowController {
         PermissionStatus.shared.refresh()
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
-        window.center()
     }
 
     private func makeWindow() -> NSWindow {
+        // setFrameAutosaveName restores any previously saved frame; only
+        // center when there wasn't one, otherwise re-centering here would
+        // fight the user's remembered position/size on every show().
+        let hasSavedFrame = UserDefaults.standard
+            .string(forKey: "NSWindow Frame \(Self.frameAutosaveName)") != nil
+
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 660, height: 600),
             styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
@@ -39,8 +46,11 @@ final class SettingsWindowController {
         window.isMovableByWindowBackground = true
         window.isReleasedWhenClosed = false
         window.minSize = NSSize(width: 640, height: 560)
-        window.setFrameAutosaveName("VoiceInputSettingsWindow")
+        window.setFrameAutosaveName(Self.frameAutosaveName)
         window.backgroundColor = .clear
+        if !hasSavedFrame {
+            window.center()
+        }
 
         // One Refiner drives both Test buttons; built once per window.
         let refiner = Refiner(settings: .shared, vocabulary: .shared)
@@ -54,12 +64,15 @@ final class SettingsWindowController {
         hosting.translatesAutoresizingMaskIntoConstraints = false
         window.contentView = hosting
 
-        // Keep permission state honest when the user returns from System Settings.
+        // Keep permission state honest when the user returns from System
+        // Settings — but only while this window is actually visible; no point
+        // refreshing on every app activation for the rest of the app's life.
         activationObserver = NotificationCenter.default.addObserver(
             forName: NSApplication.didBecomeActiveNotification,
             object: nil,
             queue: .main
-        ) { _ in
+        ) { [weak window] _ in
+            guard let window, window.isVisible else { return }
             PermissionStatus.shared.refresh()
         }
 

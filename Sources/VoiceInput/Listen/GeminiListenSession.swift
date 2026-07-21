@@ -26,7 +26,7 @@ final class GeminiListenSession: LiveCaptionSession {
     var onOriginal: ((TranscriptSnapshot) -> Void)?
     var onTranslation: ((TranscriptSnapshot) -> Void)?
     var onConnected: (() -> Void)?
-    var onError: ((String) -> Void)?
+    var onError: ((LiveCaptionError) -> Void)?
 
     private let queue = DispatchQueue(label: "VoiceInput.GeminiLive")
     private var task: URLSessionWebSocketTask?
@@ -64,7 +64,7 @@ final class GeminiListenSession: LiveCaptionSession {
 
         guard !apiKey.isEmpty else {
             DispatchQueue.main.async {
-                self.onError?("Gemini API key not configured (Settings → Providers → Live Captions).")
+                self.onError?(.terminal("Gemini API key not configured (Settings → Providers → Live Captions)."))
             }
             return
         }
@@ -184,7 +184,7 @@ final class GeminiListenSession: LiveCaptionSession {
                 case .failure(let error):
                     let nsError = error as NSError
                     if nsError.code == NSURLErrorCancelled { return }
-                    self.reportError("Gemini stream error: \(error.localizedDescription)", gen: gen)
+                    self.reportError(.recoverable("Gemini stream error: \(error.localizedDescription)"), gen: gen)
                 case .success(let message):
                     let data: Data
                     switch message {
@@ -225,8 +225,7 @@ final class GeminiListenSession: LiveCaptionSession {
         }
 
         if let error = root["error"] as? [String: Any] {
-            let message = error["message"] as? String ?? "Gemini error"
-            reportError("Gemini: \(message)", gen: gen)
+            reportError(classifyError(error), gen: gen)
             return
         }
 
@@ -304,13 +303,28 @@ final class GeminiListenSession: LiveCaptionSession {
         task.send(.string(payload)) { _ in }
     }
 
-    private func reportError(_ message: String, gen: UInt64) {
+    private func reportError(_ error: LiveCaptionError, gen: UInt64) {
         guard isCurrent(gen) else { return }
         closeOnQueue()
         DispatchQueue.main.async { [weak self] in
             guard let self, self.isCurrent(gen) else { return }
-            self.onError?(message)
+            self.onError?(error)
         }
+    }
+
+    /// Google API errors carry `code` (HTTP-style) and `status` (gRPC-style);
+    /// auth/config problems recur identically on retry, everything else
+    /// (quota, transient 5xx) is worth a reconnect.
+    private func classifyError(_ error: [String: Any]) -> LiveCaptionError {
+        let message = "Gemini: " + (error["message"] as? String ?? "Gemini error")
+        let code = error["code"] as? Int
+        let status = (error["status"] as? String ?? "").uppercased()
+        let terminalStatuses: Set<String> = [
+            "UNAUTHENTICATED", "PERMISSION_DENIED", "INVALID_ARGUMENT", "FAILED_PRECONDITION",
+        ]
+        if let code, [400, 401, 403].contains(code) { return .terminal(message) }
+        if terminalStatuses.contains(status) { return .terminal(message) }
+        return .recoverable(message)
     }
 
     private func closeOnQueue() {
