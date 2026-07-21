@@ -975,27 +975,45 @@ final class DictationController {
             return
         }
 
-        textInjector.inject(corrected)
+        // Snapshot everything BEFORE dismissReview() clears the review state.
+        let raw = reviewRawTranscript
+        let refined = reviewRefinedTranscript
+        let duration = reviewDurationSeconds
+        let backend = reviewBackend
+        let audioWAV = reviewAudioWAV
 
-        let recordID = HistoryStore.shared.record(
-            raw: reviewRawTranscript,
-            refined: reviewRefinedTranscript,
-            durationSeconds: max(0, reviewDurationSeconds),
-            backend: reviewBackend,
-            injected: true,
-            audioWAV: reviewAudioWAV
-        )
-
-        if corrected != original {
-            CorrectionStore.shared.append(
-                raw: reviewRawTranscript,
-                injected: original,
-                corrected: corrected,
-                backend: reviewBackend
-            )
-            HistoryStore.shared.updateCorrection(id: recordID, corrected: corrected)
-        }
-
+        // Order matters: the panel may hold key focus right now (the user
+        // clicked the editor or the Insert button). Injecting synthesizes
+        // Cmd-V within ~50ms — posted mid focus-transition it can land in our
+        // own dying editor or reach the target IME with the Command flag
+        // dropped (a bare 'v' opens Squirrel's symbol/emoji candidates).
+        // Resign key first, then give the target app ~150ms to take focus
+        // back before any keystroke is posted — same discipline as
+        // `replaceLastInjection` on the after-insert path.
         dismissReview()
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+            guard let self else { return }
+            self.textInjector.inject(corrected)
+
+            let recordID = HistoryStore.shared.record(
+                raw: raw,
+                refined: refined,
+                durationSeconds: max(0, duration),
+                backend: backend,
+                injected: true,
+                audioWAV: audioWAV
+            )
+
+            if corrected != original {
+                CorrectionStore.shared.append(
+                    raw: raw,
+                    injected: original,
+                    corrected: corrected,
+                    backend: backend
+                )
+                HistoryStore.shared.updateCorrection(id: recordID, corrected: corrected)
+            }
+        }
     }
 }
