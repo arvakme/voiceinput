@@ -2,7 +2,7 @@ import AppKit
 import Combine
 import os.log
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: - Core singletons
 
@@ -51,6 +51,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private var statusItem: NSStatusItem?
     private var enableMenuItem: NSMenuItem?
+    private var correctionsMenuItem: NSMenuItem?
     private var cancellables = Set<AnyCancellable>()
 
     // Debounce timer for hotkey rewire.
@@ -110,6 +111,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         // Keep running after settings window closes — hotkey must remain active.
         return false
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        if dictationController.isSessionActive {
+            dictationController.cancelSession()
+        }
+        // Blocking wrapper used ONLY here: applicationWillTerminate has no way
+        // to keep the process alive for the normal async resume, so quitting
+        // mid-dictation could leave Spotify/Music paused forever otherwise.
+        mediaController.resumeIfPausedAndWait(timeout: 2)
     }
 
     // MARK: - Preview overlay notification
@@ -190,6 +201,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case .refining, .injecting:
             symbol = "waveform"
             tint = .controlAccentColor
+        case .reviewing:
+            symbol = "pencil.circle"
+            tint = .controlAccentColor
         case .error:
             symbol = "mic.slash"
             tint = .systemRed
@@ -209,11 +223,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func buildStatusMenu(for item: NSStatusItem) {
 
         let menu = NSMenu()
+        menu.delegate = self
 
         // Status line (disabled, just informational).
         let statusLine = NSMenuItem(title: "VoiceInput", action: nil, keyEquivalent: "")
         statusLine.isEnabled = false
         menu.addItem(statusLine)
+
+        // Corrections-this-week line (disabled; refreshed in menuNeedsUpdate
+        // every time the menu opens).
+        let correctionsItem = NSMenuItem(title: "Corrections this week: 0", action: nil, keyEquivalent: "")
+        correctionsItem.isEnabled = false
+        menu.addItem(correctionsItem)
+        correctionsMenuItem = correctionsItem
 
         menu.addItem(NSMenuItem.separator())
 
@@ -275,6 +297,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(quitItem)
 
         item.menu = menu
+    }
+
+    // MARK: - NSMenuDelegate
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        correctionsMenuItem?.title = "Corrections this week: \(CorrectionStore.shared.countThisWeek())"
     }
 
     @objc private func toggleEnabled() {

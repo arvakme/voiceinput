@@ -90,6 +90,21 @@ final class MediaController {
         }
     }
 
+    /// Synchronous variant of `resumeIfPaused()`, blocking the CALLING thread
+    /// until the resume completes or `timeout` elapses. Used ONLY from
+    /// `applicationWillTerminate`: `NSApplicationDelegate` gives termination no
+    /// way to keep the process alive for the normal fire-and-forget async
+    /// path, so quitting mid-dictation could otherwise leave Spotify/Music
+    /// paused forever. Every other call site must keep using `resumeIfPaused()`.
+    func resumeIfPausedAndWait(timeout: TimeInterval) {
+        let semaphore = DispatchSemaphore(value: 0)
+        queue.async { [weak self] in
+            self?.resumeIfPausedOnQueue()
+            semaphore.signal()
+        }
+        _ = semaphore.wait(timeout: .now() + timeout)
+    }
+
     // MARK: - Queue-confined implementation
 
     private func pauseIfPlayingOnQueue() {

@@ -15,6 +15,10 @@ struct HistoryRecord: Codable, Identifiable {
     let refinedTranscript: String?
     let injected: Bool
     let audioFilename: String?
+    /// The user's post-dictation review edit, when they corrected the
+    /// injected text. Optional so pre-existing `history.json` files (written
+    /// before this field existed) still decode.
+    let correctedTranscript: String?
 
     /// The most polished transcript available: refined when present and
     /// non-empty, otherwise the raw transcript.
@@ -133,24 +137,27 @@ final class HistoryStore: ObservableObject {
     /// list is pruned to `historyMaxSessions`, deleting the audio files of any
     /// records that fall off the end.
     ///
-    /// Safe to call from any thread.
+    /// Safe to call from any thread. Returns the new record's id immediately
+    /// (even though the write itself completes asynchronously) so callers can
+    /// later target it with `updateCorrection(id:corrected:)`.
+    @discardableResult
     func record(raw: String,
                 refined: String?,
                 durationSeconds: Double,
                 backend: String,
                 injected: Bool,
-                audioWAV: Data?) {
+                audioWAV: Data?) -> UUID {
+        let id = UUID()
         let settings = AppSettings.shared
-        guard settings.historyEnabled else { return }
+        guard settings.historyEnabled else { return id }
 
         let keepAudio = settings.historyKeepAudio
         let maxSessions = max(0, settings.historyMaxSessions)
 
         // A zero cap means "keep nothing": short-circuit before doing any audio
         // write or disk work so we never pay for a pointless write-then-delete.
-        guard maxSessions > 0 else { return }
+        guard maxSessions > 0 else { return id }
 
-        let id = UUID()
         let audioData: Data? = (keepAudio && (audioWAV?.isEmpty == false)) ? audioWAV : nil
         let audioFilename: String? = audioData != nil ? "\(id.uuidString).wav" : nil
 
@@ -162,7 +169,8 @@ final class HistoryStore: ObservableObject {
             rawTranscript: raw,
             refinedTranscript: refined,
             injected: injected,
-            audioFilename: audioFilename
+            audioFilename: audioFilename,
+            correctedTranscript: nil
         )
 
         io.async { [weak self] in
@@ -185,7 +193,8 @@ final class HistoryStore: ObservableObject {
                         rawTranscript: newRecord.rawTranscript,
                         refinedTranscript: newRecord.refinedTranscript,
                         injected: newRecord.injected,
-                        audioFilename: nil
+                        audioFilename: nil,
+                        correctedTranscript: nil
                     )
                 }
             }
@@ -208,6 +217,40 @@ final class HistoryStore: ObservableObject {
 
             DispatchQueue.main.async {
                 self.records = pruned
+            }
+        }
+
+        return id
+    }
+
+    /// Applies a post-dictation review edit to the record with `id`: mutates
+    /// its `correctedTranscript` and persists. Safe to call from any thread.
+    /// A no-op (logged) if the record isn't found — e.g. history was disabled
+    /// or cleared between recording and the review completing.
+    func updateCorrection(id: UUID, corrected: String) {
+        io.async { [weak self] in
+            guard let self else { return }
+            var current = self.readRecordsFromDisk()
+            guard let index = current.firstIndex(where: { $0.id == id }) else {
+                Log.app.info("History: updateCorrection found no record for id \(id, privacy: .public)")
+                return
+            }
+            let old = current[index]
+            current[index] = HistoryRecord(
+                id: old.id,
+                date: old.date,
+                durationSeconds: old.durationSeconds,
+                backend: old.backend,
+                rawTranscript: old.rawTranscript,
+                refinedTranscript: old.refinedTranscript,
+                injected: old.injected,
+                audioFilename: old.audioFilename,
+                correctedTranscript: corrected
+            )
+            self.writeRecordsToDisk(current)
+
+            DispatchQueue.main.async {
+                self.records = current
             }
         }
     }

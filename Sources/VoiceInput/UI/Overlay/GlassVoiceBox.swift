@@ -40,6 +40,9 @@ struct GlassVoiceBox: View {
 
     var onStop: () -> Void
     var onCancel: () -> Void
+    /// Forwarded to the review editor — see `ReviewEditorView`.
+    var onReviewEditStart: () -> Void
+    var onApplyReview: (String) -> Void
 
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
@@ -51,6 +54,11 @@ struct GlassVoiceBox: View {
 
     private var isError: Bool {
         if case .error = state.phase { return true }
+        return false
+    }
+
+    private var isReviewing: Bool {
+        if case .reviewing = state.phase { return true }
         return false
     }
 
@@ -80,10 +88,21 @@ struct GlassVoiceBox: View {
     // edge handles below resizes it like a normal macOS window.
     private var expandedBody: some View {
         VStack(alignment: .leading, spacing: 14) {
-            transcriptArea
-            WaveformView(state: state)
-                .padding(.horizontal, 2)
-            bottomBar
+            if isReviewing {
+                // Replaces transcript/waveform/bottom-bar wholesale: the
+                // review editor renders inside this SAME VStack, so it still
+                // sits on the box's one glass surface (see body's note).
+                ReviewEditorView(
+                    original: state.reviewText,
+                    onEditStart: onReviewEditStart,
+                    onApply: onApplyReview
+                )
+            } else {
+                transcriptArea
+                WaveformView(state: state)
+                    .padding(.horizontal, 2)
+                bottomBar
+            }
         }
         // Optically balanced insets: the top carries the drag grabber, so it
         // needs more room or the first text line crowds/clips against it.
@@ -417,6 +436,7 @@ struct GlassVoiceBox: View {
         case .finalizing: return "Finalizing"
         case .refining:   return "Refining"
         case .injecting:  return "Inserting"
+        case .reviewing:  return "Review"
         case .idle:       return "Ready"
         case .error:      return "Error"
         }
@@ -651,6 +671,7 @@ private struct PhaseDot: View {
         case .finalizing: return .yellow
         case .refining:   return .purple
         case .injecting:  return Theme.accent
+        case .reviewing:  return Theme.accent
         case .connecting: return Theme.accent.opacity(0.7)
         case .error:      return .red
         case .idle:       return .secondary
@@ -772,5 +793,74 @@ private struct GlassActionButton: View {
         .buttonStyle(.plain)
         .onHover { hovering = $0 }
         .animation(.easeOut(duration: 0.12), value: hovering)
+    }
+}
+
+// MARK: - Review editor
+
+/// Post-dictation review: fills the same space `transcriptArea` +
+/// `WaveformView` + `bottomBar` occupy while `state.phase == .reviewing` — a
+/// plain multiline editor pre-filled with the just-injected text, a quiet
+/// hint line, and an Apply button. Deliberately carries no background/border
+/// of its own (transparent, Theme colors only) so the box still has exactly
+/// ONE Liquid Glass surface (the shared background in `GlassVoiceBox.body`).
+///
+/// Owns its own edit buffer (`text`, seeded from `original` at init) rather
+/// than binding directly to `AppState.reviewText` — `AppState` is written
+/// exclusively by `DictationController` (see its doc comment); keystrokes
+/// here stay local until Apply hands the result back through `onApply`.
+private struct ReviewEditorView: View {
+    let original: String
+    var onEditStart: () -> Void
+    var onApply: (String) -> Void
+
+    @State private var text: String
+    @FocusState private var isFocused: Bool
+
+    init(original: String, onEditStart: @escaping () -> Void, onApply: @escaping (String) -> Void) {
+        self.original = original
+        self.onEditStart = onEditStart
+        self.onApply = onApply
+        _text = State(initialValue: original)
+    }
+
+    private var isDirty: Bool { text != original }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            TextEditor(text: $text)
+                .font(.system(size: 17, weight: .medium))
+                .foregroundStyle(Theme.textPrimary)
+                .scrollContentBackground(.hidden)
+                .background(Color.clear)
+                .focused($isFocused)
+                // The user "touching" the editor — not merely the review
+                // opening — is the signal that cancels the auto-dismiss
+                // timer, so a reviewer who does nothing still sees it fade.
+                .onChange(of: isFocused) { _, focused in
+                    if focused { onEditStart() }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+            HStack(spacing: 10) {
+                Text("⌘⏎ apply · esc dismiss")
+                    .font(.system(size: 11))
+                    .foregroundStyle(Theme.textSecondary.opacity(0.7))
+                Spacer()
+                Button(action: { onApply(text) }) {
+                    Text("Apply")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(Theme.accent)
+                }
+                .buttonStyle(.plain)
+                // Kept in the hierarchy (only visually/hit-test hidden when
+                // unchanged) so ⌘⏎ always applies — DictationController's
+                // applyReview treats an unchanged result as a plain dismiss.
+                .keyboardShortcut(.return, modifiers: .command)
+                .opacity(isDirty ? 1 : 0)
+                .allowsHitTesting(isDirty)
+                .animation(.easeOut(duration: 0.12), value: isDirty)
+            }
+        }
     }
 }

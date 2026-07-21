@@ -223,6 +223,8 @@ struct ProvidersTab: View {
                 title: "Polish · OpenRouter",
                 subtitle: "Cleans disfluencies, fillers, and punctuation while preserving meaning and language."
             )
+            ollamaGLMPresetRow
+            Hairline()
             InlineRow(
                 title: "Enable polish",
                 help: "Run a cleanup pass on every transcript."
@@ -273,6 +275,46 @@ struct ProvidersTab: View {
                 runPolishTest()
             }
         }
+    }
+
+    // One-click preset: local Ollama serving GLM-5.2 via its cloud relay.
+    // reasoning_effort is "off" — the endpoint measured 2.2s round-trip
+    // without the top-level reasoning field, so there's nothing to send.
+    private static let ollamaGLMBaseURL = "http://localhost:11434/v1"
+    private static let ollamaGLMModel = "glm-5.2:cloud"
+
+    private var ollamaGLMPresetActive: Bool {
+        settings.polishBaseURL == Self.ollamaGLMBaseURL
+            && settings.polishModel == Self.ollamaGLMModel
+            && settings.polishAPIKey.isEmpty
+            && settings.polishReasoningEffort == "off"
+    }
+
+    private func applyOllamaGLMPreset() {
+        settings.polishBaseURL = Self.ollamaGLMBaseURL
+        settings.polishModel = Self.ollamaGLMModel
+        settings.polishAPIKey = ""
+        settings.polishReasoningEffort = "off"
+    }
+
+    private var ollamaGLMPresetRow: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Button(action: applyOllamaGLMPreset) {
+                HStack(spacing: 5) {
+                    if ollamaGLMPresetActive {
+                        Image(systemName: "checkmark")
+                    }
+                    Text(ollamaGLMPresetActive ? "Using Ollama · GLM-5.2 Cloud" : "Use Ollama · GLM-5.2 Cloud")
+                }
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .disabled(ollamaGLMPresetActive)
+            Text("Local Ollama relay — no key, no rate limits.")
+                .font(.system(size: 12))
+                .foregroundStyle(Theme.textSecondary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private var translatePane: some View {

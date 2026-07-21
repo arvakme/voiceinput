@@ -152,6 +152,8 @@ final class AppSettings: ObservableObject {
         static let historyEnabled               = "historyEnabled"
         static let historyKeepAudio             = "historyKeepAudio"
         static let historyMaxSessions           = "historyMaxSessions"
+        static let reviewEnabled                = "reviewEnabled"
+        static let reviewSeconds                = "reviewSeconds"
     }
 
     // The default modifier flags value: cmd | opt | ctrl | shift
@@ -251,6 +253,8 @@ final class AppSettings: ObservableObject {
         if d.object(forKey: Key.historyEnabled) == nil        { d.set(true, forKey: Key.historyEnabled) }
         if d.object(forKey: Key.historyKeepAudio) == nil      { d.set(true, forKey: Key.historyKeepAudio) }
         if d.object(forKey: Key.historyMaxSessions) == nil    { d.set(200, forKey: Key.historyMaxSessions) }
+        if d.object(forKey: Key.reviewEnabled) == nil         { d.set(true, forKey: Key.reviewEnabled) }
+        if d.object(forKey: Key.reviewSeconds) == nil         { d.set(6.0, forKey: Key.reviewSeconds) }
     }
 
     // MARK: - General
@@ -661,6 +665,30 @@ final class AppSettings: ObservableObject {
         return 200
     }() {
         didSet { defaults.set(historyMaxSessions, forKey: Key.historyMaxSessions) }
+    }
+
+    // MARK: - Post-dictation review
+
+    /// Whether the overlay stays up briefly after inject so the user can fix
+    /// a mishearing in place (see DictationController's review flow).
+    @Published var reviewEnabled: Bool = {
+        if UserDefaults.standard.object(forKey: Key.reviewEnabled) != nil {
+            return UserDefaults.standard.bool(forKey: Key.reviewEnabled)
+        }
+        return true
+    }() {
+        didSet { defaults.set(reviewEnabled, forKey: Key.reviewEnabled) }
+    }
+
+    /// Review auto-dismiss dwell, in seconds. No UI control — power users can
+    /// tune it with `defaults write com.zhijie.VoiceInput reviewSeconds <n>`.
+    @Published var reviewSeconds: Double = {
+        if UserDefaults.standard.object(forKey: Key.reviewSeconds) != nil {
+            return UserDefaults.standard.double(forKey: Key.reviewSeconds)
+        }
+        return 6.0
+    }() {
+        didSet { defaults.set(reviewSeconds, forKey: Key.reviewSeconds) }
     }
 
     // MARK: - Derived

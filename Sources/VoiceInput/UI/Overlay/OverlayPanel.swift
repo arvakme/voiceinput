@@ -18,6 +18,13 @@ final class OverlayPanel {
     var onStop: (() -> Void)?
     /// Fired on the glass "Cancel" capsule or on Esc.
     var onCancel: (() -> Void)?
+    /// Fired the first time the user focuses the post-dictation review editor
+    /// (see GlassVoiceBox's ReviewEditorView). DictationController cancels the
+    /// review's auto-dismiss timer on this signal.
+    var onReviewEditStart: (() -> Void)?
+    /// Fired by ⌘⏎ or the review editor's Apply button with the (possibly
+    /// unedited) review text.
+    var onApplyReview: ((String) -> Void)?
 
     private let state: AppState
     private let settings: AppSettings
@@ -105,6 +112,18 @@ final class OverlayPanel {
         hotkeyLabel.label = display
     }
 
+    /// Whether the panel is allowed to become key. `false` (the default) for
+    /// the entire dictation lifecycle — the whole point of `NonActivatingPanel`
+    /// is that showing the HUD never steals focus. `DictationController` sets
+    /// this `true` only while `AppState.phase == .reviewing`, so a click into
+    /// the review editor can make the panel (and only the panel — the
+    /// styleMask keeps it `.nonactivatingPanel`, so our app itself never
+    /// activates) key, and sets it back to `false` on every exit path.
+    var allowsKeyFocus: Bool {
+        get { (panel as? NonActivatingPanel)?.allowsKeyFocus ?? false }
+        set { (panel as? NonActivatingPanel)?.allowsKeyFocus = newValue }
+    }
+
     // MARK: - Panel construction
 
     private func ensurePanel() -> NSPanel {
@@ -117,7 +136,9 @@ final class OverlayPanel {
             presentation: presentation,
             resizeController: resizeController,
             onStop: { [weak self] in self?.onStop?() },
-            onCancel: { [weak self] in self?.onCancel?() }
+            onCancel: { [weak self] in self?.onCancel?() },
+            onReviewEditStart: { [weak self] in self?.onReviewEditStart?() },
+            onApplyReview: { [weak self] text in self?.onApplyReview?(text) }
         )
 
         let hosting = FirstMouseHostingView(rootView: root)
@@ -385,10 +406,17 @@ final class BoxResizeController {
 
 // MARK: - Non-activating panel subclass
 
-/// An `NSPanel` that refuses key/main status so showing the HUD never steals
-/// focus from the app the user is dictating into.
+/// An `NSPanel` that refuses key status by default so showing the HUD never
+/// steals focus from the app the user is dictating into. `allowsKeyFocus` is
+/// the sole, narrow exception: `OverlayPanel.allowsKeyFocus` flips it on only
+/// for the post-dictation review editor's lifetime. Even then the panel never
+/// becomes MAIN and its styleMask stays `.nonactivatingPanel`, so our app
+/// itself is never activated — only the panel takes key status, letting the
+/// review `TextEditor` accept keyboard input while focus snaps straight back
+/// to the target app the moment the panel orders out.
 private final class NonActivatingPanel: NSPanel {
-    override var canBecomeKey: Bool { false }
+    var allowsKeyFocus = false
+    override var canBecomeKey: Bool { allowsKeyFocus }
     override var canBecomeMain: Bool { false }
 }
 
@@ -419,6 +447,8 @@ fileprivate struct OverlayRootView: View {
 
     var onStop: () -> Void
     var onCancel: () -> Void
+    var onReviewEditStart: () -> Void
+    var onApplyReview: (String) -> Void
 
     var body: some View {
         GlassVoiceBox(
@@ -427,7 +457,9 @@ fileprivate struct OverlayRootView: View {
             hotkeyLabel: hotkeyLabel,
             resizeController: resizeController,
             onStop: onStop,
-            onCancel: onCancel
+            onCancel: onCancel,
+            onReviewEditStart: onReviewEditStart,
+            onApplyReview: onApplyReview
         )
         .scaleEffect(presentation.isPresented ? 1 : 0.97)
         .opacity(presentation.isPresented ? 1 : 0)

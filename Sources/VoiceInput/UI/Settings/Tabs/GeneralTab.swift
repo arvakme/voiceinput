@@ -35,6 +35,15 @@ struct GeneralTab: View {
                 ) {
                     BlueToggle(isOn: $settings.mediaAutoPause)
                 }
+
+                Hairline()
+
+                InlineRow(
+                    title: "Post-dictation review",
+                    help: "Shows the injected text for a few seconds so you can fix mishearings in place. Your edits also teach the vocabulary system."
+                ) {
+                    BlueToggle(isOn: $settings.reviewEnabled)
+                }
             }
         }
     }

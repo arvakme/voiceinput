@@ -11,8 +11,16 @@ import Carbon
 /// user can still manually paste.
 final class TextInjector {
 
+    /// The app that was frontmost the last time `inject()` ran — captured so
+    /// `replaceLastInjection` knows which app to re-activate before undoing
+    /// the prior paste, even if focus moved elsewhere (e.g. to our own
+    /// review overlay) in the meantime.
+    private(set) var lastTarget: NSRunningApplication?
+
     func inject(_ text: String) {
         guard !text.isEmpty else { return }
+
+        lastTarget = NSWorkspace.shared.frontmostApplication
 
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
@@ -31,16 +39,7 @@ final class TextInjector {
         }
 
         // Synthesise Cmd+V (requires Accessibility permission).
-        let source   = CGEventSource(stateID: .combinedSessionState)
-        let vKeyCode: CGKeyCode = 0x09
-
-        let keyDown = CGEvent(keyboardEventSource: source, virtualKey: vKeyCode, keyDown: true)
-        keyDown?.flags = .maskCommand
-        let keyUp   = CGEvent(keyboardEventSource: source, virtualKey: vKeyCode, keyDown: false)
-        keyUp?.flags = .maskCommand
-
-        keyDown?.post(tap: .cgAnnotatedSessionEventTap)
-        keyUp?.post(tap: .cgAnnotatedSessionEventTap)
+        postCommandKey(0x09)
 
         Log.keys.info("TextInjector: injected \(text.count) chars needSwitch=\(needSwitch)")
 
@@ -50,6 +49,55 @@ final class TextInjector {
                 TISSelectInputSource(originalSource)
             }
         }
+    }
+
+    /// Replaces the previously injected text with `corrected` from the
+    /// post-dictation review box: re-activates `lastTarget` if it isn't
+    /// already frontmost, undoes the prior paste with a synthetic Cmd-Z, then
+    /// runs the normal inject path with the corrected text.
+    ///
+    /// Best-effort by design: this assumes the target app treats a pasted
+    /// string as one undoable step (true for most native text fields/editors).
+    /// Apps that don't implement undo for a paste (some web text areas,
+    /// terminals) will just get the correction pasted in after a harmless
+    /// no-op Cmd-Z — there is no reliable cross-app way to detect or select
+    /// the previously-injected range, so we don't attempt anything more
+    /// precise than undo-then-re-paste.
+    func replaceLastInjection(with corrected: String) {
+        guard !corrected.isEmpty else { return }
+
+        if let lastTarget, !lastTarget.isActive {
+            _ = lastTarget.activate()
+        }
+
+        // Give the target app's focus time to settle after (re)activating
+        // before we post keystrokes at it.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+            guard let self else { return }
+            self.postCommandKey(0x06) // Cmd-Z
+            Log.keys.info("TextInjector: posted undo before replacement")
+
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.10) {
+                self.inject(corrected)
+            }
+        }
+    }
+
+    // MARK: - Key posting
+
+    /// Posts a synthetic Cmd+`keyCode` key-down/key-up pair (requires
+    /// Accessibility permission). Shared by `inject`'s Cmd-V and
+    /// `replaceLastInjection`'s Cmd-Z.
+    private func postCommandKey(_ keyCode: CGKeyCode) {
+        let source = CGEventSource(stateID: .combinedSessionState)
+
+        let keyDown = CGEvent(keyboardEventSource: source, virtualKey: keyCode, keyDown: true)
+        keyDown?.flags = .maskCommand
+        let keyUp = CGEvent(keyboardEventSource: source, virtualKey: keyCode, keyDown: false)
+        keyUp?.flags = .maskCommand
+
+        keyDown?.post(tap: .cgAnnotatedSessionEventTap)
+        keyUp?.post(tap: .cgAnnotatedSessionEventTap)
     }
 
     // MARK: - Input-source helpers

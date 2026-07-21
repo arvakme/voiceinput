@@ -10,6 +10,10 @@ enum DictationPhase: Equatable {
     case finalizing
     case refining
     case injecting
+    /// The overlay stays up showing the just-injected text for a few seconds
+    /// so the user can fix a mishearing in place. Not audio-active — see
+    /// WaveformView.isLive and DictationController's review flow.
+    case reviewing
     case error(String)
 }
 
@@ -56,6 +60,12 @@ final class AppState: ObservableObject {
 
     /// The kind of the currently active session. `nil` when no session is active.
     @Published var sessionKind: SessionKind? = nil
+
+    /// The injected text shown for editing during `.reviewing`. Kept separate
+    /// from `phase` (rather than an associated value) so the phase enum stays
+    /// a simple switch target everywhere else. Only meaningful while
+    /// `phase == .reviewing`.
+    @Published var reviewText: String = ""
 
     private init() {}
 }

@@ -65,7 +65,7 @@ struct WaveformView: View {
     private var isLive: Bool {
         switch state.phase {
         case .connecting, .listening, .finalizing: return true
-        case .idle, .refining, .injecting, .error: return false
+        case .idle, .refining, .injecting, .reviewing, .error: return false
         }
     }
 
