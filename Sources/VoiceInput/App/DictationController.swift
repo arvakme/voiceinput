@@ -47,6 +47,9 @@ final class DictationController {
     private var carriedText: String = ""
     /// The current engine's own (session-local) latest snapshot.
     private var engineSnapshot = TranscriptSnapshot()
+    /// `session?.isStreaming` for the currently-running engine, cached so
+    /// `armSilenceCountdown()` doesn't need to re-derive it from settings.
+    private var currentEngineIsStreaming: Bool = false
 
     private var cancellables = Set<AnyCancellable>()
 
@@ -221,6 +224,13 @@ final class DictationController {
         let asrSession = TranscriptionFactory.make(settings: settings, vocabulary: vocabulary)
         session = asrSession
 
+        // Whether THIS engine streams incrementally — provider-agnostic
+        // replacement for reading `settings.asrBackend` as a mode proxy,
+        // which can disagree with the actual engine (e.g. Qwen forces batch
+        // regardless of the Mode picker's stored value).
+        let isStreaming = asrSession.isStreaming
+        currentEngineIsStreaming = isStreaming
+
         // Wire callbacks.
         asrSession.audioLevelHandler = { [weak self] level in
             // Already on main (per contract).
@@ -245,10 +255,10 @@ final class DictationController {
                 self.lastTranscriptChangeDate = Date()
             }
 
-            // Arm silence countdown only for hands-free + realtime mode
+            // Arm silence countdown only for hands-free + streaming engines
             // (batch backends produce no incremental tokens).
             if kind == .handsFree &&
-               self.settings.asrBackend == .sonioxRealtime &&
+               isStreaming &&
                (wasEmpty || self.silenceTimer == nil) {
                 self.armSilenceCountdown()
             }
@@ -258,7 +268,7 @@ final class DictationController {
             guard let self else { return }
             guard self.sessionGeneration == generation else { return }
             // Already on main (per contract).
-            if kind == .handsFree && self.settings.asrBackend == .sonioxRealtime {
+            if kind == .handsFree && isStreaming {
                 self.utteranceEndFired = true
                 self.lastTranscriptChangeDate = Date()
                 self.armSilenceCountdown()
@@ -374,7 +384,7 @@ final class DictationController {
         sessionBackend = "\(settings.voiceProvider.rawValue)/\(settings.asrBackend.rawValue)"
         teardownSilenceTimer()
 
-        let oldIsBatch = old is HTTPTranscriptionSession || old is SonioxAsyncSession
+        let oldIsBatch = !old.isStreaming
         if oldIsBatch {
             // A batch engine has recorded audio but shown nothing — transcribe
             // it in the background and splice the result in when it lands.
@@ -506,9 +516,9 @@ final class DictationController {
     // MARK: - Hands-free silence countdown
 
     private func armSilenceCountdown() {
-        // Only relevant for hands-free + Soniox.
+        // Only relevant for hands-free + a streaming engine.
         guard appState.sessionKind == .handsFree,
-              settings.asrBackend == .sonioxRealtime else { return }
+              currentEngineIsStreaming else { return }
 
         // If a timer is already running, let it keep ticking.
         if silenceTimer != nil { return }

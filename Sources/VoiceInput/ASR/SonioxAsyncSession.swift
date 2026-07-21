@@ -28,6 +28,8 @@ final class SonioxAsyncSession: TranscriptionSession {
 
     var capturedAudioWAV: Data? { capture.capturedAudioWAV }
 
+    var isStreaming: Bool { false }
+
     // MARK: - Private state
 
     private let settings: AppSettings

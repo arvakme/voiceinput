@@ -462,15 +462,20 @@ struct GlassVoiceBox: View {
     // Just transcribe and applies IMMEDIATELY — DictationController hot-swaps
     // the live engine, carrying the transcript so far. Right-click Translate
     // to pick the target language.
+    //
+    // Qwen has no realtime session, so its chip is inert and always reads
+    // "Transcribe" regardless of the (possibly stale) asrBackend value —
+    // matches the Providers tab, which hides the Mode picker for Qwen.
     private var chips: some View {
         HStack(spacing: 6) {
             Button {
+                guard settings.voiceProvider != .qwen else { return }
                 settings.asrBackend = settings.asrBackend == .sonioxRealtime
                     ? .openAICompatible : .sonioxRealtime
             } label: {
                 FeatureChip(
-                    title: settings.asrBackend.chipLabel,
-                    active: settings.asrBackend == .sonioxRealtime
+                    title: settings.voiceProvider == .qwen ? ASRBackend.openAICompatible.chipLabel : settings.asrBackend.chipLabel,
+                    active: settings.voiceProvider != .qwen && settings.asrBackend == .sonioxRealtime
                 )
             }
             .buttonStyle(.plain)

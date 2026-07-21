@@ -85,6 +85,7 @@ struct ProvidersTab: View {
             switch settings.voiceProvider {
             case .soniox: return !settings.sonioxAPIKey.trimmed.isEmpty
             case .openai: return !settings.httpASRAPIKey.trimmed.isEmpty
+            case .qwen:   return !settings.qwenAPIKey.trimmed.isEmpty
             }
         case .polish:
             return !settings.polishBaseURL.trimmed.isEmpty && !settings.polishModel.trimmed.isEmpty
@@ -114,13 +115,11 @@ struct ProvidersTab: View {
         Card {
             CardHeading(
                 title: "Voice model",
-                subtitle: settings.asrBackend == .sonioxRealtime
-                    ? "Realtime: words stream into the voice box live while you speak."
-                    : "Just transcribe: records locally, sends once at stop. No live words."
+                subtitle: voicePaneSubtitle
             )
             InlineRow(
                 title: "Provider",
-                help: "Soniox and OpenAI both support realtime streaming and batch transcription."
+                help: "Soniox and OpenAI support realtime streaming and batch transcription; Qwen is batch-only (\"Just transcribe\")."
             ) {
                 Picker("", selection: $settings.voiceProvider) {
                     ForEach(VoiceProvider.allCases, id: \.self) { provider in
@@ -129,23 +128,29 @@ struct ProvidersTab: View {
                 }
                 .pickerStyle(.segmented)
                 .labelsHidden()
-                .frame(width: 200)
+                .frame(width: 260)
             }
-            InlineRow(
-                title: "Mode",
-                help: "Switching during a session takes effect immediately — also available as a chip in the voice box."
-            ) {
-                Picker("", selection: $settings.asrBackend) {
-                    ForEach(ASRBackend.allCases, id: \.self) { backend in
-                        Text(backend.displayName).tag(backend)
+            // Qwen has no realtime session yet, so the Mode picker (and the
+            // voice-box chip that mirrors it) would be misleading — hide it
+            // rather than let it select a mode that silently falls back.
+            if settings.voiceProvider != .qwen {
+                InlineRow(
+                    title: "Mode",
+                    help: "Switching during a session takes effect immediately — also available as a chip in the voice box."
+                ) {
+                    Picker("", selection: $settings.asrBackend) {
+                        ForEach(ASRBackend.allCases, id: \.self) { backend in
+                            Text(backend.displayName).tag(backend)
+                        }
                     }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .frame(width: 240)
                 }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .frame(width: 240)
             }
             Hairline()
-            if settings.voiceProvider == .soniox {
+            switch settings.voiceProvider {
+            case .soniox:
                 FieldRow(
                     title: "API key",
                     help: "Soniox API key. Stored in your local preferences."
@@ -175,7 +180,7 @@ struct ProvidersTab: View {
                         )
                     }
                 }
-            } else {
+            case .openai:
                 FieldRow(
                     title: "API key",
                     help: "OpenAI API key (used for both realtime and batch)."
@@ -213,8 +218,42 @@ struct ProvidersTab: View {
                         )
                     }
                 }
+            case .qwen:
+                FieldRow(
+                    title: "Base URL",
+                    help: "DashScope's OpenAI-compatible gateway. ASR is a chat-completions request with the audio embedded, not /audio/transcriptions."
+                ) {
+                    FilledTextField(placeholder: "https://dashscope.aliyuncs.com/compatible-mode/v1", text: $settings.qwenBaseURL, monospaced: true)
+                }
+                FieldRow(
+                    title: "API key",
+                    help: "DashScope API key. Stored in your local preferences."
+                ) {
+                    SecureFieldRow(placeholder: "sk-…", text: $settings.qwenAPIKey)
+                }
+                FieldRow(
+                    title: "Model",
+                    help: "Qwen3-ASR model identifier."
+                ) {
+                    ModelPickerField(
+                        placeholder: "qwen3-asr-flash",
+                        model: $settings.qwenModel,
+                        kind: .chat,
+                        baseURL: { settings.qwenBaseURL },
+                        apiKey: { settings.qwenAPIKey }
+                    )
+                }
             }
         }
+    }
+
+    private var voicePaneSubtitle: String {
+        if settings.voiceProvider == .qwen {
+            return "Just transcribe only: records locally, sends once at stop as a single chat-completions request with the audio embedded."
+        }
+        return settings.asrBackend == .sonioxRealtime
+            ? "Realtime: words stream into the voice box live while you speak."
+            : "Just transcribe: records locally, sends once at stop. No live words."
     }
 
     private var polishPane: some View {

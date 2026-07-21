@@ -26,6 +26,8 @@ final class OpenAIRealtimeSession: TranscriptionSession {
 
     var capturedAudioWAV: Data? { capture.capturedAudioWAV }
 
+    var isStreaming: Bool { true }
+
     // MARK: - Private state
 
     private let settings: AppSettings

@@ -19,6 +19,17 @@ protocol TranscriptionSession: AnyObject {
     /// accumulated finals so that `stop(completion:)` can still return them.
     var onError: ((String) -> Void)? { get set }
 
+    // MARK: Mode
+
+    /// Whether this session streams tokens incrementally during recording
+    /// (Soniox/OpenAI realtime) vs. delivering one transcript at `stop()`
+    /// (the batch backends). Callers use this instead of type-checking a
+    /// concrete session class or reading `AppSettings.asrBackend` — the
+    /// latter reflects the user's UI selection, which can disagree with the
+    /// actual running engine for providers that force a single mode (e.g.
+    /// Qwen, which is batch-only regardless of the Mode picker).
+    var isStreaming: Bool { get }
+
     // MARK: Audio level passthrough (main thread)
 
     /// Re-exposed from the underlying `AudioCapture`; set before calling `start()`.
@@ -64,6 +75,13 @@ enum TranscriptionFactory {
             return OpenAIRealtimeSession(settings: settings, vocabulary: vocabulary)
         case (.openai, .openAICompatible):
             return HTTPTranscriptionSession(settings: settings, vocabulary: vocabulary)
+        case (.qwen, .sonioxRealtime), (.qwen, .openAICompatible):
+            // Qwen has no realtime session yet — always batch, even if
+            // asrBackend is still (or gets set to) .sonioxRealtime (e.g. a
+            // stale value carried over from a previously-selected provider).
+            // The Providers tab hides the Mode picker for Qwen so a user can't
+            // reach this from the UI, but the fallback keeps it crash-safe.
+            return QwenChatASRSession(settings: settings, vocabulary: vocabulary)
         }
     }
 }

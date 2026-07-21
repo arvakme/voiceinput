@@ -37,6 +37,8 @@ final class SonioxRealtimeSession: TranscriptionSession {
     /// Captured session audio as a WAV (materialised lazily on read).
     var capturedAudioWAV: Data? { capture.capturedAudioWAV }
 
+    var isStreaming: Bool { true }
+
     // MARK: - Private constants
 
     private static let websocketURL = URL(string: "wss://stt-rt.soniox.com/transcribe-websocket")!

@@ -35,4 +35,25 @@ else
     echo "OPENROUTER_API_KEY not set in .env.local — skipping polishAPIKey."
 fi
 
+if [ -n "${QWEN_API_KEY:-}" ]; then
+    defaults write "$BUNDLE_ID" qwenAPIKey "$QWEN_API_KEY"
+    echo "Written qwenAPIKey to $BUNDLE_ID defaults."
+else
+    echo "QWEN_API_KEY not set in .env.local — skipping qwenAPIKey."
+fi
+
+if [ -n "${QWEN_BASE_URL:-}" ]; then
+    defaults write "$BUNDLE_ID" qwenBaseURL "$QWEN_BASE_URL"
+    echo "Written qwenBaseURL to $BUNDLE_ID defaults."
+else
+    echo "QWEN_BASE_URL not set in .env.local — skipping qwenBaseURL."
+fi
+
+if [ -n "${QWEN_MODEL:-}" ]; then
+    defaults write "$BUNDLE_ID" qwenModel "$QWEN_MODEL"
+    echo "Written qwenModel to $BUNDLE_ID defaults."
+else
+    echo "QWEN_MODEL not set in .env.local — skipping qwenModel."
+fi
+
 echo "Done."

@@ -30,11 +30,13 @@ enum ASRBackend: String, CaseIterable {
 enum VoiceProvider: String, CaseIterable {
     case soniox
     case openai
+    case qwen
 
     var displayName: String {
         switch self {
         case .soniox: return "Soniox"
         case .openai: return "OpenAI"
+        case .qwen:   return "Qwen"
         }
     }
 }
@@ -109,6 +111,9 @@ final class AppSettings: ObservableObject {
         static let httpASRBaseURL               = "httpASRBaseURL"
         static let httpASRAPIKey                = "httpASRAPIKey"
         static let httpASRModel                 = "httpASRModel"
+        static let qwenBaseURL                   = "qwenBaseURL"
+        static let qwenAPIKey                    = "qwenAPIKey"
+        static let qwenModel                     = "qwenModel"
         static let polishEnabled                = "polishEnabled"
         static let polishBaseURL                = "polishBaseURL"
         static let polishAPIKey                 = "polishAPIKey"
@@ -205,6 +210,9 @@ final class AppSettings: ObservableObject {
         if d.object(forKey: Key.httpASRBaseURL) == nil        { d.set("https://api.openai.com/v1", forKey: Key.httpASRBaseURL) }
         if d.object(forKey: Key.httpASRAPIKey) == nil         { d.set("", forKey: Key.httpASRAPIKey) }
         if d.object(forKey: Key.httpASRModel) == nil          { d.set("gpt-4o-mini-transcribe", forKey: Key.httpASRModel) }
+        if d.object(forKey: Key.qwenBaseURL) == nil           { d.set("https://dashscope.aliyuncs.com/compatible-mode/v1", forKey: Key.qwenBaseURL) }
+        if d.object(forKey: Key.qwenAPIKey) == nil            { d.set("", forKey: Key.qwenAPIKey) }
+        if d.object(forKey: Key.qwenModel) == nil             { d.set("qwen3-asr-flash", forKey: Key.qwenModel) }
         if d.object(forKey: Key.polishEnabled) == nil         { d.set(true, forKey: Key.polishEnabled) }
         if d.object(forKey: Key.polishBaseURL) == nil         { d.set("https://openrouter.ai/api/v1", forKey: Key.polishBaseURL) }
         if d.object(forKey: Key.polishAPIKey) == nil          { d.set("", forKey: Key.polishAPIKey) }
@@ -358,6 +366,27 @@ final class AppSettings: ObservableObject {
         return v.isEmpty ? "gpt-4o-mini-transcribe" : v
     }() {
         didSet { defaults.set(httpASRModel, forKey: Key.httpASRModel) }
+    }
+
+    /// Qwen3-ASR (Alibaba DashScope) base URL — an OpenAI-compatible gateway,
+    /// but ASR is a chat-completions request with embedded audio, not
+    /// `/audio/transcriptions` (see `QwenChatASRSession`).
+    @Published var qwenBaseURL: String = {
+        let v = UserDefaults.standard.string(forKey: Key.qwenBaseURL) ?? "https://dashscope.aliyuncs.com/compatible-mode/v1"
+        return v.isEmpty ? "https://dashscope.aliyuncs.com/compatible-mode/v1" : v
+    }() {
+        didSet { defaults.set(qwenBaseURL, forKey: Key.qwenBaseURL) }
+    }
+
+    @Published var qwenAPIKey: String = UserDefaults.standard.string(forKey: Key.qwenAPIKey) ?? "" {
+        didSet { defaults.set(qwenAPIKey, forKey: Key.qwenAPIKey) }
+    }
+
+    @Published var qwenModel: String = {
+        let v = UserDefaults.standard.string(forKey: Key.qwenModel) ?? "qwen3-asr-flash"
+        return v.isEmpty ? "qwen3-asr-flash" : v
+    }() {
+        didSet { defaults.set(qwenModel, forKey: Key.qwenModel) }
     }
 
     // MARK: - Refinement
