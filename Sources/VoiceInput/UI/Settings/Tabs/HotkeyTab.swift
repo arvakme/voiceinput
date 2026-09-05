@@ -8,6 +8,7 @@ struct HotkeyTab: View {
     @EnvironmentObject private var settings: AppSettings
 
     @State private var timingExpanded = false
+    @State private var isRecordingShortcut = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -38,12 +39,29 @@ struct HotkeyTab: View {
                     title: "Custom shortcut",
                     help: "Click the field, then press the key combination you want (needs at least one modifier)."
                 ) {
-                    ShortcutRecorder(
-                        keyCode: $settings.customHotkeyKeyCode,
-                        modifierFlags: $settings.customHotkeyModifierFlags,
-                        keyEquivalent: $settings.customHotkeyKeyEquivalent
-                    )
-                    .frame(height: 30)
+                    ZStack(alignment: .leading) {
+                        ShortcutRecorder(
+                            keyCode: $settings.customHotkeyKeyCode,
+                            modifierFlags: $settings.customHotkeyModifierFlags,
+                            keyEquivalent: $settings.customHotkeyKeyEquivalent,
+                            isRecording: $isRecordingShortcut
+                        )
+                        .frame(height: 30)
+                        // Kept in the hit-test tree (this is what actually
+                        // captures the keystroke) but visually replaced by
+                        // the keycap row below it.
+                        .opacity(0.011)
+
+                        KeycapRowView(
+                            shortcut: HotkeyShortcut(
+                                keyCode: UInt16(max(0, min(settings.customHotkeyKeyCode, Int(UInt16.max)))),
+                                modifierFlags: NSEvent.ModifierFlags(rawValue: UInt(max(0, settings.customHotkeyModifierFlags))),
+                                keyEquivalent: settings.customHotkeyKeyEquivalent
+                            ),
+                            isRecording: isRecordingShortcut
+                        )
+                        .allowsHitTesting(false)
+                    }
                     .frame(maxWidth: 280, alignment: .leading)
                 }
             } else if settings.hotkeyKey != .fn {
@@ -175,9 +193,11 @@ private struct ShortcutRecorder: NSViewRepresentable {
     @Binding var keyCode: Int
     @Binding var modifierFlags: Int
     @Binding var keyEquivalent: String
+    @Binding var isRecording: Bool
 
     func makeNSView(context: Context) -> ShortcutRecorderButton {
         let button = ShortcutRecorderButton(frame: .zero)
+        button.isBordered = false
         configure(button)
         return button
     }
@@ -197,6 +217,9 @@ private struct ShortcutRecorder: NSViewRepresentable {
             modifierFlags = Int(shortcut.modifierFlags.rawValue)
             keyEquivalent = shortcut.keyEquivalent
         }
+        button.onRecordingChange = { recording in
+            if isRecording != recording { isRecording = recording }
+        }
     }
 }
 
@@ -213,6 +236,7 @@ private final class ShortcutRecorderButton: NSButton {
         didSet { if !isRecording { title = shortcut.displayString } }
     }
     var onCapture: ((HotkeyShortcut) -> Void)?
+    var onRecordingChange: ((Bool) -> Void)?
 
     private var monitor: Any?
     private var windowCloseObserver: NSObjectProtocol?
@@ -241,6 +265,7 @@ private final class ShortcutRecorderButton: NSButton {
     @objc private func beginRecording() {
         guard !isRecording else { return }
         isRecording = true
+        onRecordingChange?(true)
         title = "Press shortcut…"
         window?.makeFirstResponder(self)
         monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
@@ -262,7 +287,16 @@ private final class ShortcutRecorderButton: NSButton {
         }
     }
 
+    // Only the local monitor started in `beginRecording` should feed keys
+    // into `capture` — without this guard, this override fires for ANY
+    // keyDown reaching the button as first responder (e.g. the window still
+    // had it focused from an earlier click), silently overwriting the
+    // stored shortcut with whatever the user typed next.
     override func keyDown(with event: NSEvent) {
+        guard isRecording else {
+            super.keyDown(with: event)
+            return
+        }
         capture(event)
     }
 
@@ -310,6 +344,7 @@ private final class ShortcutRecorderButton: NSButton {
             self.windowCloseObserver = nil
         }
         isRecording = false
+        onRecordingChange?(false)
         title = shortcut.displayString
     }
 
@@ -334,12 +369,17 @@ private final class ShortcutRecorderButton: NSButton {
         return result
     }
 
+    /// Prefers the keyCode-based table over the modifier-transformed
+    /// character: holding Control (or Option, for some keys) turns
+    /// `charactersIgnoringModifiers` into a control character or an
+    /// unrelated glyph — e.g. Ctrl+L reports as a form-feed, not "L" — which
+    /// used to get stored and displayed as literal mojibake. The table gives
+    /// the physical key's real name regardless of what modifiers did to it.
     private static func keyName(for keyCode: UInt16, fallback: String) -> String {
+        if let known = knownKeyNames[keyCode] { return known }
         let trimmed = fallback.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !trimmed.isEmpty {
-            return trimmed.uppercased()
-        }
-        return knownKeyNames[keyCode] ?? "#\(keyCode)"
+        let isPrintable = !trimmed.isEmpty && trimmed.unicodeScalars.allSatisfy { !CharacterSet.controlCharacters.contains($0) }
+        return isPrintable ? trimmed.uppercased() : "#\(keyCode)"
     }
 
     private static let knownKeyNames: [UInt16: String] = [
@@ -348,10 +388,59 @@ private final class ShortcutRecorderButton: NSButton {
         16: "Y", 17: "T", 18: "1", 19: "2", 20: "3", 21: "4", 22: "6",
         23: "5", 24: "=", 25: "9", 26: "7", 27: "-", 28: "8", 29: "0",
         30: "]", 31: "O", 32: "U", 33: "[", 34: "I", 35: "P", 37: "L",
+        123: "←", 124: "→", 125: "↓", 126: "↑",
         38: "J", 39: "'", 40: "K", 41: ";", 42: "\\", 43: ",", 44: "/",
         45: "N", 46: "M", 47: ".", 48: "Tab", 49: "Space", 51: "Delete",
         53: "Esc", 76: "Enter", 96: "F5", 97: "F6", 98: "F7", 99: "F3",
         100: "F8", 101: "F9", 103: "F11", 109: "F10", 111: "F12",
         118: "F4", 122: "F1", 120: "F2"
     ]
+}
+
+// MARK: - Keycap row (Raycast-style shortcut display)
+
+/// Purely visual: renders `shortcut` as a row of individual keycap chips
+/// instead of one button with a concatenated symbol+letter string. Sits on
+/// top of the (visually hidden) `ShortcutRecorder` button, which still does
+/// the actual key capture.
+private struct KeycapRowView: View {
+    let shortcut: HotkeyShortcut
+    let isRecording: Bool
+
+    private var keys: [String] {
+        guard !isRecording else { return ["press…"] }
+        var parts: [String] = []
+        if shortcut.modifierFlags.contains(.function) { parts.append("fn") }
+        if shortcut.modifierFlags.contains(.control)  { parts.append("⌃") }
+        if shortcut.modifierFlags.contains(.option)   { parts.append("⌥") }
+        if shortcut.modifierFlags.contains(.shift)    { parts.append("⇧") }
+        if shortcut.modifierFlags.contains(.command)  { parts.append("⌘") }
+        parts.append(HotkeyShortcut.keyName(for: shortcut.keyCode, fallback: shortcut.keyEquivalent))
+        return parts
+    }
+
+    var body: some View {
+        HStack(spacing: 5) {
+            ForEach(Array(keys.enumerated()), id: \.offset) { _, key in
+                Text(key)
+                    .font(.system(size: 12, weight: .semibold, design: .rounded))
+                    .foregroundStyle(isRecording ? Theme.accent : Theme.textPrimary)
+                    .padding(.horizontal, 8)
+                    .frame(height: 26)
+                    .background(
+                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            .fill(Theme.contentBackground)
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            .strokeBorder(isRecording ? Theme.accent : Theme.hairline, lineWidth: 1)
+                    )
+            }
+        }
+        .opacity(isRecording ? 0.55 : 1)
+        .animation(
+            isRecording ? .easeInOut(duration: 0.7).repeatForever(autoreverses: true) : .default,
+            value: isRecording
+        )
+    }
 }

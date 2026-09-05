@@ -101,6 +101,7 @@ struct GlassVoiceBox: View {
                     original: state.reviewText,
                     awaitingInsert: state.reviewAwaitingInsert,
                     countdown: state.reviewCountdown,
+                    polishFailed: state.reviewPolishFailed,
                     onEditStart: onReviewEditStart,
                     onApply: onApplyReview
                 )
@@ -470,19 +471,20 @@ struct GlassVoiceBox: View {
     // the live engine, carrying the transcript so far. Right-click Translate
     // to pick the target language.
     //
-    // Qwen has no realtime session, so its chip is inert and always reads
-    // "Transcribe" regardless of the (possibly stale) asrBackend value —
-    // matches the Providers tab, which hides the Mode picker for Qwen.
+    // Providers with a `forcedBackend` (Qwen: batch-only, Doubao: realtime-
+    // only) have an inert chip that always reads their forced mode
+    // regardless of the (possibly stale) asrBackend value — matches the
+    // Providers tab, which hides the Mode picker for them too.
     private var chips: some View {
         HStack(spacing: 6) {
             Button {
-                guard settings.voiceProvider != .qwen else { return }
+                guard settings.voiceProvider.forcedBackend == nil else { return }
                 settings.asrBackend = settings.asrBackend == .sonioxRealtime
                     ? .openAICompatible : .sonioxRealtime
             } label: {
                 FeatureChip(
-                    title: settings.voiceProvider == .qwen ? ASRBackend.openAICompatible.chipLabel : settings.asrBackend.chipLabel,
-                    active: settings.voiceProvider != .qwen && settings.asrBackend == .sonioxRealtime
+                    title: (settings.voiceProvider.forcedBackend ?? settings.asrBackend).chipLabel,
+                    active: (settings.voiceProvider.forcedBackend ?? settings.asrBackend) == .sonioxRealtime
                 )
             }
             .buttonStyle(.plain)
@@ -833,6 +835,10 @@ private struct ReviewEditorView: View {
     let original: String
     let awaitingInsert: Bool
     let countdown: Double?
+    /// True when `Refiner` fell back to unpolished text this session (a
+    /// network/API failure), so the reviewer isn't left thinking Polish
+    /// silently does nothing — see `AppState.reviewPolishFailed`.
+    let polishFailed: Bool
     var onEditStart: () -> Void
     var onApply: (String) -> Void
 
@@ -842,11 +848,13 @@ private struct ReviewEditorView: View {
     init(original: String,
          awaitingInsert: Bool,
          countdown: Double?,
+         polishFailed: Bool,
          onEditStart: @escaping () -> Void,
          onApply: @escaping (String) -> Void) {
         self.original = original
         self.awaitingInsert = awaitingInsert
         self.countdown = countdown
+        self.polishFailed = polishFailed
         self.onEditStart = onEditStart
         self.onApply = onApply
         _text = State(initialValue: original)
@@ -872,6 +880,19 @@ private struct ReviewEditorView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
+            if polishFailed {
+                HStack(spacing: 5) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                    Text("Polish 未生效，这是原始转录")
+                }
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(Color.orange)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(
+                    Capsule(style: .continuous).fill(Color.orange.opacity(0.15))
+                )
+            }
             TextEditor(text: $text)
                 .font(.system(size: 17, weight: .medium))
                 .foregroundStyle(Theme.textPrimary)

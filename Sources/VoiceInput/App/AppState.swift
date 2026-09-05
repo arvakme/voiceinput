@@ -75,6 +75,13 @@ final class AppState: ObservableObject {
     /// Only meaningful while `phase == .reviewing`.
     @Published var reviewAwaitingInsert: Bool = false
 
+    /// True when the polish step for the current review fell back to
+    /// unpolished text (an API/network failure), not merely "nothing to
+    /// change". Drives a visible warning in the review editor instead of
+    /// letting `Refiner`'s never-fail fallback look identical to success.
+    /// Only meaningful while `phase == .reviewing`.
+    @Published var reviewPolishFailed: Bool = false
+
     /// Seconds remaining before a "before"-mode review auto-inserts.
     /// `nil` whenever no countdown is running — "after"/"off" review, or once
     /// the user has touched the editor (touching cancels it; see

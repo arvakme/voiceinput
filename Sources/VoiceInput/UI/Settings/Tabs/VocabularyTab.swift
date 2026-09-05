@@ -149,6 +149,12 @@ struct VocabularyTab: View {
     private func entryRow(index: Int, entry: VocabularyEntry) -> some View {
         let isSelected = selectedID == entry.id
         return HStack(spacing: 12) {
+            if entry.autoLearned {
+                Image(systemName: "wand.and.stars")
+                    .font(.system(size: 10))
+                    .foregroundStyle(Theme.accent)
+                    .help("Learned automatically from a review-box correction")
+            }
             cellField(
                 placeholder: "Claude Code",
                 value: Binding(

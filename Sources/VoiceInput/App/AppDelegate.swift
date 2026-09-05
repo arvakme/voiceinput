@@ -20,7 +20,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }()
 
     private lazy var refiner: Refiner = {
-        Refiner(settings: settings, vocabulary: VocabularyStore.shared)
+        Refiner(settings: settings, vocabulary: VocabularyStore.shared, presets: PolishPresetStore.shared)
     }()
 
     private lazy var dictationController: DictationController = {
@@ -28,6 +28,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             settings: settings,
             appState: appState,
             refiner: refiner,
+            presets: PolishPresetStore.shared,
             textInjector: textInjector,
             mediaController: mediaController,
             overlayPanel: overlayPanel
@@ -76,6 +77,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         requestPermissionsOnLaunch()
         wireKeyMonitor()
         observeSettings()
+        wireURLScheme()
 
         // Live Captions hotkey (Fn+Space toggle, Fn+Shift+Space layout).
         listenHotkey.onToggle = { [weak self] in
@@ -378,6 +380,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         keyMonitor.start()
+    }
+
+    // MARK: - URL scheme
+
+    /// `voiceinput://toggle` — lets external triggers (a SketchyBar icon
+    /// click, a Shortcuts action, `open voiceinput://toggle` in a script)
+    /// start/stop dictation the same way a Toggle-mode hotkey tap does,
+    /// without needing to hold or locate any key at all.
+    private func wireURLScheme() {
+        NSAppleEventManager.shared().setEventHandler(
+            self,
+            andSelector: #selector(handleGetURLEvent(_:withReplyEvent:)),
+            forEventClass: AEEventClass(kInternetEventClass),
+            andEventID: AEEventID(kAEGetURL)
+        )
+    }
+
+    @objc private func handleGetURLEvent(_ event: NSAppleEventDescriptor, withReplyEvent: NSAppleEventDescriptor) {
+        guard let urlString = event.paramDescriptor(forKeyword: keyDirectObject)?.stringValue,
+              let url = URL(string: urlString),
+              url.scheme?.lowercased() == "voiceinput"
+        else { return }
+
+        switch url.host?.lowercased() {
+        case "toggle":
+            guard settings.appEnabled else { return }
+            if dictationController.isSessionActive {
+                dictationController.endSession()
+            } else {
+                dictationController.beginSession(kind: .toggle)
+            }
+        default:
+            Log.app.warning("Unrecognized voiceinput:// command: \(urlString, privacy: .public)")
+        }
     }
 
     // MARK: - Settings observation

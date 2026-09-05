@@ -225,7 +225,8 @@ enum RimeLexiconImporter {
             guard columns.count >= 3 else { continue }
 
             let word = columns[1].trimmingCharacters(in: .whitespaces)
-            guard word.count >= 2, word.count <= 20, !stopwords.contains(word) else { continue }
+            guard word.count >= 2, word.count <= 20, !stopwords.contains(word),
+                  isSuitableHotwordCandidate(word) else { continue }
 
             var c = 0
             var d = 0.0
@@ -241,6 +242,11 @@ enum RimeLexiconImporter {
     }
 
     /// custom_phrase.txt rows: `word\tcode\t[weight]` — word is column 1.
+    /// Rime power users commonly repurpose custom phrases as autofill
+    /// snippets (a short code that expands to a full email/phone/address) —
+    /// exactly the kind of entry `isSuitableHotwordCandidate` rejects, since
+    /// it's both a poor hotword (not a short recognizable term) and personal
+    /// data that shouldn't be attached to every cloud ASR request.
     private static func parseCustomPhrase(at url: URL) -> [String] {
         guard let content = try? String(contentsOf: url, encoding: .utf8) else { return [] }
 
@@ -250,7 +256,7 @@ enum RimeLexiconImporter {
             guard !line.isEmpty, !line.hasPrefix("#") else { continue }
             guard let word = line.split(separator: "\t").first else { continue }
             let trimmed = word.trimmingCharacters(in: .whitespaces)
-            guard !trimmed.isEmpty else { continue }
+            guard !trimmed.isEmpty, isSuitableHotwordCandidate(trimmed) else { continue }
             words.append(trimmed)
         }
         return words
@@ -272,10 +278,23 @@ enum RimeLexiconImporter {
             guard !trimmed.isEmpty, !trimmed.hasPrefix("#") else { continue }
             guard let word = rawLine.split(separator: "\t").first else { continue }
             let w = word.trimmingCharacters(in: .whitespaces)
-            guard !w.isEmpty else { continue }
+            guard !w.isEmpty, isSuitableHotwordCandidate(w) else { continue }
             words.append(w)
         }
         return words
+    }
+
+    /// Rejects autofill-style personal data (emails, phone numbers, ID
+    /// numbers, full addresses) before it ever reaches the vocabulary list:
+    /// it's privacy-sensitive to hand a cloud ASR provider on every session,
+    /// and it's a poor hotword candidate anyway — hotwording biases
+    /// recognition toward short jargon/names, not full sentences of digits
+    /// and punctuation.
+    private static func isSuitableHotwordCandidate(_ word: String) -> Bool {
+        guard word.count <= 16 else { return false }
+        guard !word.contains("@"), !word.contains(",") else { return false }
+        let digitCount = word.filter(\.isNumber).count
+        return digitCount < 6
     }
 
     private static func uniquePreservingOrder(_ items: [String]) -> [String] {

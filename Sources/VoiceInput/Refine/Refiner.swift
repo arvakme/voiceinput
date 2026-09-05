@@ -12,11 +12,20 @@ final class Refiner {
 
     private let settings: AppSettings
     private let vocabulary: VocabularyStore
+    private let presets: PolishPresetStore
 
-    init(settings: AppSettings, vocabulary: VocabularyStore) {
+    init(settings: AppSettings, vocabulary: VocabularyStore, presets: PolishPresetStore) {
         self.settings = settings
         self.vocabulary = vocabulary
+        self.presets = presets
     }
+
+    /// Whether the polish step in the most recent `refine()` call fell back
+    /// to unpolished text — a network/API failure, not "nothing to polish".
+    /// Read this right after `refine()`'s completion fires (main thread,
+    /// same as the completion itself) to show the user their text skipped
+    /// polish rather than letting the never-fail fallback look silent.
+    private(set) var lastPolishFailed = false
 
     // MARK: - Cancellation
 
@@ -41,6 +50,7 @@ final class Refiner {
         taskLock.lock()
         cancelled = false
         taskLock.unlock()
+        lastPolishFailed = false
 
         var steps: [Step] = []
         if settings.polishEnabled    { steps.append(.polish) }
@@ -106,6 +116,7 @@ final class Refiner {
                 self?.taskLock.unlock()
                 if case RefinerError.cancelled = error, wasCancelled { return }
 
+                if case .polish = step { self?.lastPolishFailed = true }
                 Log.refine.error("\(step.label) failed, continuing with best text: \(error.localizedDescription)")
                 completion(input)
             }
@@ -317,10 +328,18 @@ final class Refiner {
     private func endpointConfig(for step: Step) -> EndpointConfig {
         switch step {
         case .polish:
+            let preset = presets.selected
+            guard preset.modelOverrideEnabled else {
+                return EndpointConfig(
+                    baseURL: settings.polishBaseURL,
+                    apiKey: settings.polishAPIKey.trimmingCharacters(in: .whitespacesAndNewlines),
+                    model: settings.polishModel.trimmingCharacters(in: .whitespacesAndNewlines)
+                )
+            }
             return EndpointConfig(
-                baseURL: settings.polishBaseURL,
-                apiKey: settings.polishAPIKey.trimmingCharacters(in: .whitespacesAndNewlines),
-                model: settings.polishModel.trimmingCharacters(in: .whitespacesAndNewlines)
+                baseURL: preset.modelBaseURL,
+                apiKey: preset.modelAPIKey.trimmingCharacters(in: .whitespacesAndNewlines),
+                model: preset.modelName.trimmingCharacters(in: .whitespacesAndNewlines)
             )
         case .translate:
             return EndpointConfig(
@@ -342,44 +361,19 @@ final class Refiner {
         }
     }
 
+    /// The active preset's prompt, plus the vocabulary hint block every
+    /// preset gets appended (mishearing corrections matter in Coding
+    /// dictation as much as Daily).
     private func buildPolishPrompt() -> String {
         let vocabSection = vocabulary.promptSection
-        let vocabBlock: String
-        if vocabSection.isEmpty {
-            vocabBlock = ""
-        } else {
-            vocabBlock = """
+        guard !vocabSection.isEmpty else { return presets.selected.systemPrompt }
+
+        return presets.selected.systemPrompt + """
 
 
-VOCABULARY:
-If the transcript contains something like the left side, the speaker almost certainly meant the right side:
-\(vocabSection)
-"""
-        }
-
-        return """
-            You are a text polish pass for a voice-dictation tool.
-
-            TASK:
-            - Clean up disfluencies, filler words, repeated words, false starts, punctuation, and obvious grammar issues.
-            - Preserve the speaker's meaning, intent, tone, and source language.
-            - Do not translate. If the input mixes Chinese, English, Korean, or technical terms, keep that natural mix.
-
-            DICTATION CONTEXT:
-            The speaker is often dictating short notes while coding on macOS. The language may be Mandarin Chinese, English, or mixed Chinese-English developer speech. Preferred tech terms: build, rebuild, run, rerun, restart, relaunch, app, VoiceInput, repo, GitHub, branch, commit, push, pull, merge, PR, diff, patch, Swift, SwiftUI, AppKit, Xcode, macOS, OpenAI, API, JSON, URL, WebSocket, localhost.
-
-            ASR CORRECTION:
-            - Repair obvious speech-recognition mistakes using the dictation context.
-            - Prefer the smallest correction that makes the sentence match what the speaker likely meant.
-            - Example: "备份" in developer coding context may be the English word "build"; "重写" may be "重启".
-            - Keep English tech words in English when they are likely intended as technical terms.\(vocabBlock)
-
-            PRESERVE VERBATIM:
-            - Brand, product, and company names.
-            - Technical identifiers: code snippets, API names, file paths, URLs, CLI commands, variables, functions, and flags.
-            - Acronyms such as API, URL, LLM, GPU, CPU, HTTP, JSON.
-
-            OUTPUT: Return ONLY the polished text. No explanations, notes, prefaces, framing, or surrounding quotation marks.
+            VOCABULARY:
+            If the transcript contains something like the left side, the speaker almost certainly meant the right side:
+            \(vocabSection)
             """
     }
 

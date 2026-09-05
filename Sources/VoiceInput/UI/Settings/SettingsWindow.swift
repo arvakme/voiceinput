@@ -53,12 +53,13 @@ final class SettingsWindowController {
         }
 
         // One Refiner drives both Test buttons; built once per window.
-        let refiner = Refiner(settings: .shared, vocabulary: .shared)
+        let refiner = Refiner(settings: .shared, vocabulary: .shared, presets: .shared)
 
         let root = SettingsRootView(refiner: refiner)
             .environmentObject(AppSettings.shared)
             .environmentObject(VocabularyStore.shared)
             .environmentObject(PermissionStatus.shared)
+            .environmentObject(PolishPresetStore.shared)
 
         let hosting = NSHostingView(rootView: root)
         hosting.translatesAutoresizingMaskIntoConstraints = false

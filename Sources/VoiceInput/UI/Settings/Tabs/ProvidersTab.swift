@@ -1,115 +1,33 @@
 import SwiftUI
 
-/// ChatWise-style master-detail provider configuration. A narrow source list
-/// names each backend with a configured/unconfigured status dot; the detail
-/// pane shows only that provider's fields.
+/// Flat stacked cards, one per configurable backend — same shape as every
+/// other Settings tab (`GeneralTab`, `AppearanceTab`, …). This used to be a
+/// ChatWise-style master-detail view with its own inner sidebar, which meant
+/// two different navigation idioms nested inside one Settings window for a
+/// grand total of four sections. Not enough content to earn a second nav
+/// layer, so it's gone.
 struct ProvidersTab: View {
     let refiner: Refiner
 
     @EnvironmentObject private var settings: AppSettings
+    @EnvironmentObject private var presetStore: PolishPresetStore
 
-    @State private var selection: ProviderItem = .voice
+    @State private var voiceOutcome: TestOutcome = .idle
     @State private var polishOutcome: TestOutcome = .idle
     @State private var translateOutcome: TestOutcome = .idle
-
-    enum ProviderItem: String, CaseIterable, Identifiable {
-        case voice
-        case polish
-        case translate
-        case liveCaptions
-
-        var id: String { rawValue }
-
-        var title: String {
-            switch self {
-            case .voice:        return "Voice model"
-            case .polish:       return "Polish model"
-            case .translate:    return "Translate model"
-            case .liveCaptions: return "Live Captions"
-            }
-        }
-
-        var symbol: String {
-            switch self {
-            case .voice:        return "waveform"
-            case .polish:       return "sparkles"
-            case .translate:    return "globe"
-            case .liveCaptions: return "captions.bubble"
-            }
-        }
-    }
-
-    /// User-adjustable source-list width, persisted across launches.
-    @AppStorage("providersSidebarWidth") private var sidebarWidth: Double = 170
+    @State private var editingPreset: PolishPreset?
+    @State private var showingNewPresetSheet = false
 
     var body: some View {
-        HStack(alignment: .top, spacing: 0) {
-            sourceList
-            SplitDragHandle(width: $sidebarWidth, range: 140...320)
-            detail
-                .frame(maxWidth: .infinity, alignment: .leading)
+        VStack(alignment: .leading, spacing: 16) {
+            voicePane
+            polishPane
+            translatePane
+            liveCaptionsPane
         }
     }
 
-    // MARK: Source list
-
-    private var sourceList: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            ForEach(ProviderItem.allCases) { item in
-                SourceListRow(
-                    symbol: item.symbol,
-                    title: item.title,
-                    configured: isConfigured(item),
-                    isSelected: selection == item
-                ) {
-                    selection = item
-                }
-            }
-            Spacer(minLength: 0)
-        }
-        .padding(8)
-        .frame(width: max(140, sidebarWidth), alignment: .top)
-        .background(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(Theme.sidebarBackground)
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .strokeBorder(Theme.hairline, lineWidth: 1)
-        )
-    }
-
-    private func isConfigured(_ item: ProviderItem) -> Bool {
-        switch item {
-        case .voice:
-            switch settings.voiceProvider {
-            case .soniox: return !settings.sonioxAPIKey.trimmed.isEmpty
-            case .openai: return !settings.httpASRAPIKey.trimmed.isEmpty
-            case .qwen:   return !settings.qwenAPIKey.trimmed.isEmpty
-            }
-        case .polish:
-            return !settings.polishBaseURL.trimmed.isEmpty && !settings.polishModel.trimmed.isEmpty
-        case .translate:
-            return !settings.translateBaseURL.trimmed.isEmpty && !settings.translateModel.trimmed.isEmpty
-        case .liveCaptions:
-            switch settings.liveCaptionProvider {
-            case .soniox: return !settings.sonioxAPIKey.trimmed.isEmpty
-            case .gemini: return !settings.geminiAPIKey.trimmed.isEmpty
-            }
-        }
-    }
-
-    // MARK: Detail panes
-
-    @ViewBuilder
-    private var detail: some View {
-        switch selection {
-        case .voice:        voicePane
-        case .polish:       polishPane
-        case .translate:    translatePane
-        case .liveCaptions: liveCaptionsPane
-        }
-    }
+    // MARK: Voice model
 
     private var voicePane: some View {
         Card {
@@ -119,7 +37,7 @@ struct ProvidersTab: View {
             )
             InlineRow(
                 title: "Provider",
-                help: "Soniox and OpenAI support realtime streaming and batch transcription; Qwen is batch-only (\"Just transcribe\")."
+                help: "Soniox supports both Realtime streaming and batch transcription; Doubao is realtime-only."
             ) {
                 Picker("", selection: $settings.voiceProvider) {
                     ForEach(VoiceProvider.allCases, id: \.self) { provider in
@@ -128,12 +46,12 @@ struct ProvidersTab: View {
                 }
                 .pickerStyle(.segmented)
                 .labelsHidden()
-                .frame(width: 260)
+                .frame(width: 180)
             }
-            // Qwen has no realtime session yet, so the Mode picker (and the
-            // voice-box chip that mirrors it) would be misleading — hide it
-            // rather than let it select a mode that silently falls back.
-            if settings.voiceProvider != .qwen {
+            // Doubao has no batch session yet, so the Mode picker would let you
+            // select a mode that silently falls back to realtime anyway — hide
+            // it rather than expose a choice that doesn't do anything.
+            if settings.voiceProvider.forcedBackend == nil {
                 InlineRow(
                     title: "Mode",
                     help: "Switching during a session takes effect immediately — also available as a chip in the voice box."
@@ -180,81 +98,37 @@ struct ProvidersTab: View {
                         )
                     }
                 }
-            case .openai:
+            case .doubao:
                 FieldRow(
                     title: "API key",
-                    help: "OpenAI API key (used for both realtime and batch)."
+                    help: "Volcengine console → 语音技术 → 豆包语音识别大模型 → API Key（新版控制台的 X-Api-Key）。"
                 ) {
-                    SecureFieldRow(placeholder: "sk-…", text: $settings.httpASRAPIKey)
-                }
-                if settings.asrBackend == .sonioxRealtime {
-                    FieldRow(
-                        title: "Realtime model",
-                        help: "Streams over wss://api.openai.com/v1/realtime (intent=transcription)."
-                    ) {
-                        ModelPickerField(
-                            placeholder: "gpt-4o-mini-transcribe",
-                            model: $settings.openAIRealtimeModel,
-                            kind: .openAIRealtime
-                        )
-                    }
-                } else {
-                    FieldRow(
-                        title: "Base URL",
-                        help: "api.openai.com or any OpenAI-compatible server."
-                    ) {
-                        FilledTextField(placeholder: "https://api.openai.com/v1", text: $settings.httpASRBaseURL, monospaced: true)
-                    }
-                    FieldRow(
-                        title: "Transcribe model",
-                        help: "Posted to /audio/transcriptions as one WAV."
-                    ) {
-                        ModelPickerField(
-                            placeholder: "gpt-4o-mini-transcribe",
-                            model: $settings.httpASRModel,
-                            kind: .transcription,
-                            baseURL: { settings.httpASRBaseURL },
-                            apiKey: { settings.httpASRAPIKey }
-                        )
-                    }
-                }
-            case .qwen:
-                FieldRow(
-                    title: "Base URL",
-                    help: "DashScope's OpenAI-compatible gateway. ASR is a chat-completions request with the audio embedded, not /audio/transcriptions."
-                ) {
-                    FilledTextField(placeholder: "https://dashscope.aliyuncs.com/compatible-mode/v1", text: $settings.qwenBaseURL, monospaced: true)
+                    SecureFieldRow(placeholder: "your-api-key", text: $settings.doubaoAPIKey)
                 }
                 FieldRow(
-                    title: "API key",
-                    help: "DashScope API key. Stored in your local preferences."
+                    title: "Resource ID",
+                    help: "Which purchased resource pack to bill against. ASR 2.0 (Seed-ASR, recommended): volc.seedasr.sauc.duration. ASR 1.0: volc.bigasr.sauc.duration."
                 ) {
-                    SecureFieldRow(placeholder: "sk-…", text: $settings.qwenAPIKey)
+                    FilledTextField(placeholder: "volc.seedasr.sauc.duration", text: $settings.doubaoResourceId, monospaced: true)
                 }
-                FieldRow(
-                    title: "Model",
-                    help: "Qwen3-ASR model identifier."
-                ) {
-                    ModelPickerField(
-                        placeholder: "qwen3-asr-flash",
-                        model: $settings.qwenModel,
-                        kind: .chat,
-                        baseURL: { settings.qwenBaseURL },
-                        apiKey: { settings.qwenAPIKey }
-                    )
-                }
+            }
+            Hairline()
+            TestButton(title: "Test connection", outcome: voiceOutcome) {
+                runVoiceTest()
             }
         }
     }
 
     private var voicePaneSubtitle: String {
-        if settings.voiceProvider == .qwen {
-            return "Just transcribe only: records locally, sends once at stop as a single chat-completions request with the audio embedded."
+        if settings.voiceProvider == .doubao {
+            return "Realtime only: same Seed-ASR model behind 豆包输入法/抖音/剪映, streamed over Volcengine's bidirectional WebSocket."
         }
         return settings.asrBackend == .sonioxRealtime
             ? "Realtime: words stream into the voice box live while you speak."
             : "Just transcribe: records locally, sends once at stop. No live words."
     }
+
+    // MARK: Polish model
 
     private var polishPane: some View {
         Card {
@@ -262,7 +136,7 @@ struct ProvidersTab: View {
                 title: "Polish · OpenRouter",
                 subtitle: "Cleans disfluencies, fillers, and punctuation while preserving meaning and language."
             )
-            ollamaGLMPresetRow
+            presetRow
             Hairline()
             InlineRow(
                 title: "Enable polish",
@@ -314,47 +188,78 @@ struct ProvidersTab: View {
                 runPolishTest()
             }
         }
-    }
-
-    // One-click preset: local Ollama serving GLM-5.2 via its cloud relay.
-    // reasoning_effort is "off" — the endpoint measured 2.2s round-trip
-    // without the top-level reasoning field, so there's nothing to send.
-    private static let ollamaGLMBaseURL = "http://localhost:11434/v1"
-    private static let ollamaGLMModel = "glm-5.2:cloud"
-
-    private var ollamaGLMPresetActive: Bool {
-        settings.polishBaseURL == Self.ollamaGLMBaseURL
-            && settings.polishModel == Self.ollamaGLMModel
-            && settings.polishAPIKey.isEmpty
-            && settings.polishReasoningEffort == "off"
-    }
-
-    private func applyOllamaGLMPreset() {
-        settings.polishBaseURL = Self.ollamaGLMBaseURL
-        settings.polishModel = Self.ollamaGLMModel
-        settings.polishAPIKey = ""
-        settings.polishReasoningEffort = "off"
-    }
-
-    private var ollamaGLMPresetRow: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Button(action: applyOllamaGLMPreset) {
-                HStack(spacing: 5) {
-                    if ollamaGLMPresetActive {
-                        Image(systemName: "checkmark")
-                    }
-                    Text(ollamaGLMPresetActive ? "Using Ollama · GLM-5.2 Cloud" : "Use Ollama · GLM-5.2 Cloud")
-                }
-            }
-            .buttonStyle(.bordered)
-            .controlSize(.small)
-            .disabled(ollamaGLMPresetActive)
-            Text("Local Ollama relay — no key, no rate limits.")
-                .font(.system(size: 12))
-                .foregroundStyle(Theme.textSecondary)
+        .sheet(item: $editingPreset) { preset in
+            PresetEditorView(preset: preset)
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .sheet(isPresented: $showingNewPresetSheet) {
+            PresetEditorView(preset: nil)
+        }
     }
+
+    /// Icon + name dropdown selecting which `PolishPreset` drives the next
+    /// dictation's polish pass. Its own model/review overrides (if any) live
+    /// in the edit sheet, not inline here — the fields below always show the
+    /// global Polish defaults that presets fall back to.
+    private var presetRow: some View {
+        InlineRow(
+            title: "Preset",
+            help: "Which prompt (and optional model) Polish uses for the next dictation."
+        ) {
+            HStack(spacing: 6) {
+                Menu {
+                    ForEach(presetStore.presets) { preset in
+                        Button {
+                            presetStore.selectedPresetID = preset.id
+                        } label: {
+                            Label(preset.name, systemImage: preset.icon)
+                        }
+                    }
+                    Divider()
+                    Button {
+                        showingNewPresetSheet = true
+                    } label: {
+                        Label("New Preset…", systemImage: "plus")
+                    }
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: presetStore.selected.icon)
+                        Text(presetStore.selected.name)
+                    }
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(Theme.textPrimary)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 7)
+                    .background(
+                        RoundedRectangle(cornerRadius: 8, style: .continuous).fill(Theme.fieldFill)
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 8, style: .continuous).strokeBorder(Theme.hairline, lineWidth: 1)
+                    )
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+
+                Button {
+                    editingPreset = presetStore.selected
+                } label: {
+                    Image(systemName: "pencil")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(Theme.textSecondary)
+                        .frame(width: 26, height: 26)
+                        .background(
+                            RoundedRectangle(cornerRadius: 7, style: .continuous).fill(Theme.fieldFill)
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 7, style: .continuous).strokeBorder(Theme.hairline, lineWidth: 1)
+                        )
+                }
+                .buttonStyle(.plain)
+                .help("Edit this preset")
+            }
+        }
+    }
+
+    // MARK: Translate model
 
     private var translatePane: some View {
         Card {
@@ -410,6 +315,8 @@ struct ProvidersTab: View {
             }
         }
     }
+
+    // MARK: Live Captions
 
     private var liveCaptionsPane: some View {
         Card {
@@ -487,6 +394,33 @@ struct ProvidersTab: View {
 
     // MARK: Tests
 
+    /// Streaming ASR has no request/response round trip the way Polish's
+    /// chat-completions call does, so this only proves the WebSocket handshake
+    /// and auth are accepted — see `ASRConnectionTester`.
+    private func runVoiceTest() {
+        voiceOutcome = .running
+        let completion: (Result<String, ASRConnectionTester.ConnectionError>) -> Void = { result in
+            switch result {
+            case .success(let text):  voiceOutcome = .success(text)
+            case .failure(let error): voiceOutcome = .failure(error.message)
+            }
+        }
+        switch settings.voiceProvider {
+        case .soniox:
+            ASRConnectionTester.testSoniox(
+                apiKey: settings.sonioxAPIKey,
+                model: settings.sonioxModel,
+                completion: completion
+            )
+        case .doubao:
+            ASRConnectionTester.testDoubao(
+                apiKey: settings.doubaoAPIKey,
+                resourceId: settings.doubaoResourceId,
+                completion: completion
+            )
+        }
+    }
+
     private func runPolishTest() {
         polishOutcome = .running
         refiner.testPolish { result in
@@ -510,8 +444,4 @@ struct ProvidersTab: View {
             }
         }
     }
-}
-
-private extension String {
-    var trimmed: String { trimmingCharacters(in: .whitespacesAndNewlines) }
 }

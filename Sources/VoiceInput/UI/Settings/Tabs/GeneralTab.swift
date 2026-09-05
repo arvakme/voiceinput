@@ -18,7 +18,7 @@ struct GeneralTab: View {
 
                 FieldRow(
                     title: "Language hints",
-                    help: "ISO codes, e.g. zh,en — passed to Soniox as language_hints."
+                    help: "ISO codes, e.g. zh,en — passed to Soniox as language_hints. Doubao's bidirectional streaming mode ignores this and auto-detects instead."
                 ) {
                     FilledTextField(
                         placeholder: "zh,en",

@@ -3,36 +3,25 @@ import SwiftUI
 // MARK: - Model catalog fetching
 
 /// Fetches available model identifiers from a provider endpoint. Speaks both
-/// list dialects: OpenAI-style (`GET {base}/models`, Bearer auth — OpenAI,
-/// OpenRouter, Cerebras, Ollama, …) and Anthropic-style (same path, but
-/// `x-api-key` + `anthropic-version` headers). Soniox realtime has no public
-/// list endpoint, so it ships a curated catalog.
+/// list dialects: OpenAI-style (`GET {base}/models`, Bearer auth — OpenRouter,
+/// Cerebras, Ollama, …) and Anthropic-style (same path, but `x-api-key` +
+/// `anthropic-version` headers). Soniox realtime has no public list endpoint,
+/// so it ships a curated catalog.
 enum ModelCatalog {
     enum Kind {
         case chat            // every model the endpoint lists
-        case transcription   // audio/STT-flavoured subset (falls back to all)
         case sonioxRealtime  // curated static list
         case sonioxAsync     // curated static list
-        case openAIRealtime  // curated realtime-transcription models
     }
 
     static let sonioxModels = ["stt-rt-v5", "stt-rt-v4", "stt-rt-preview"]
     static let sonioxAsyncModels = ["stt-async-v5", "stt-async-preview", "stt-async-v4"]
-    static let openAIRealtimeModels = ["gpt-4o-mini-transcribe", "gpt-4o-transcribe", "gpt-realtime-whisper"]
-
-    /// Heuristic for surfacing audio-capable models first when the caller
-    /// asked for transcription models.
-    private static let audioHint = try! NSRegularExpression(
-        pattern: "whisper|transcrib|realtime|audio|speech|voice|asr|stt",
-        options: [.caseInsensitive]
-    )
 
     static func fetch(kind: Kind, baseURL: String, apiKey: String) async throws -> [String] {
         switch kind {
         case .sonioxRealtime: return sonioxModels
         case .sonioxAsync:    return sonioxAsyncModels
-        case .openAIRealtime: return openAIRealtimeModels
-        case .chat, .transcription: break
+        case .chat: break
         }
 
         let base = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -62,15 +51,6 @@ enum ModelCatalog {
         }
         var ids = list.compactMap { $0["id"] as? String }
         ids = Array(Set(ids)).sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
-
-        if case .transcription = kind {
-            let audio = ids.filter {
-                audioHint.firstMatch(in: $0, range: NSRange($0.startIndex..., in: $0)) != nil
-            }
-            // If the endpoint has recognisable audio models, lead with those;
-            // search in the picker still reaches everything.
-            if !audio.isEmpty { ids = audio + ids.filter { !audio.contains($0) } }
-        }
         return ids
     }
 

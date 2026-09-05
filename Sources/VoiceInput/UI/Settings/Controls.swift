@@ -263,19 +263,6 @@ struct TestButton: View {
     }
 }
 
-// MARK: - Status dot
-
-/// Small filled dot: green when a provider is configured, gray otherwise.
-struct StatusDot: View {
-    let configured: Bool
-
-    var body: some View {
-        Circle()
-            .fill(configured ? Color.green : Theme.textSecondary.opacity(0.4))
-            .frame(width: 7, height: 7)
-    }
-}
-
 // MARK: - ChatWise +/- list controls
 
 /// The +/- bordered button strip anchored at a list's bottom-left, ChatWise
@@ -321,44 +308,6 @@ struct ListControlBar: View {
     }
 }
 
-// MARK: - Master-detail source-list row
-
-/// A row in the Providers source list: optional SF Symbol, title, status dot,
-/// selectable with an accent-tinted highlight.
-struct SourceListRow: View {
-    let symbol: String
-    let title: String
-    let configured: Bool
-    let isSelected: Bool
-    let action: () -> Void
-
-    var body: some View {
-        Button(action: action) {
-            HStack(spacing: 9) {
-                Image(systemName: symbol)
-                    .font(.system(size: 13, weight: .regular))
-                    .foregroundStyle(isSelected ? Theme.accent : Theme.textSecondary)
-                    .frame(width: 18)
-                Text(title)
-                    .font(.system(size: 13, weight: isSelected ? .semibold : .regular))
-                    .foregroundStyle(isSelected ? Theme.textPrimary : Theme.textPrimary.opacity(0.85))
-                    .lineLimit(1)
-                Spacer(minLength: 6)
-                StatusDot(configured: configured)
-            }
-            .padding(.horizontal, 9)
-            .padding(.vertical, 7)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(
-                RoundedRectangle(cornerRadius: 7, style: .continuous)
-                    .fill(isSelected ? Theme.pill : Color.clear)
-            )
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-    }
-}
-
 // MARK: - Section heading inside a card
 
 /// A lightweight in-card heading: weight-and-spacing hierarchy, no uppercase.
@@ -379,68 +328,5 @@ struct CardHeading: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-    }
-}
-
-// MARK: - Split drag handle
-
-/// A slim gutter between master/detail panes that drags the sidebar width,
-/// macOS-split-view style. Implemented as a real NSView so the drag wins even
-/// in windows with `isMovableByWindowBackground = true` — a SwiftUI
-/// DragGesture loses that race because AppKit claims the mouseDown as a
-/// window-background drag before the gesture's minimum distance is met.
-struct SplitDragHandle: NSViewRepresentable {
-    @Binding var width: Double
-    let range: ClosedRange<Double>
-
-    func makeNSView(context: Context) -> SplitDragNSView {
-        let view = SplitDragNSView()
-        view.onBegin = { context.coordinator.startWidth = width }
-        view.onDrag = { delta in
-            let proposed = context.coordinator.startWidth + delta
-            width = min(max(proposed, range.lowerBound), range.upperBound)
-        }
-        return view
-    }
-
-    func updateNSView(_ nsView: SplitDragNSView, context: Context) {}
-
-    func sizeThatFits(_ proposal: ProposedViewSize, nsView: SplitDragNSView, context: Context) -> CGSize? {
-        CGSize(width: 16, height: proposal.height ?? 100)
-    }
-
-    func makeCoordinator() -> Coordinator { Coordinator() }
-
-    final class Coordinator {
-        var startWidth: Double = 0
-    }
-}
-
-final class SplitDragNSView: NSView {
-    var onBegin: (() -> Void)?
-    var onDrag: ((Double) -> Void)?
-
-    private var startMouseX: CGFloat = 0
-
-    // The whole point: without this, a window with
-    // isMovableByWindowBackground treats our mouseDown as "drag the window".
-    override var mouseDownCanMoveWindow: Bool { false }
-
-    override func resetCursorRects() {
-        addCursorRect(bounds, cursor: .resizeLeftRight)
-    }
-
-    override func mouseDown(with event: NSEvent) {
-        startMouseX = NSEvent.mouseLocation.x
-        onBegin?()
-    }
-
-    override func mouseDragged(with event: NSEvent) {
-        NSCursor.resizeLeftRight.set()
-        onDrag?(NSEvent.mouseLocation.x - startMouseX)
-    }
-
-    override func mouseUp(with event: NSEvent) {
-        NSCursor.arrow.set()
     }
 }

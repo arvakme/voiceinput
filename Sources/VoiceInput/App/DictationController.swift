@@ -25,6 +25,7 @@ final class DictationController {
     private let settings: AppSettings
     private let appState: AppState
     private let refiner: Refiner
+    private let presets: PolishPresetStore
     private let textInjector: TextInjector
     private let mediaController: MediaController
     private let overlayPanel: OverlayPanel
@@ -98,12 +99,14 @@ final class DictationController {
     init(settings: AppSettings,
          appState: AppState,
          refiner: Refiner,
+         presets: PolishPresetStore,
          textInjector: TextInjector,
          mediaController: MediaController,
          overlayPanel: OverlayPanel) {
         self.settings = settings
         self.appState = appState
         self.refiner = refiner
+        self.presets = presets
         self.textInjector = textInjector
         self.mediaController = mediaController
         self.overlayPanel = overlayPanel
@@ -754,6 +757,7 @@ final class DictationController {
 
         appState.reviewText = injectedText
         appState.reviewAwaitingInsert = false
+        appState.reviewPolishFailed = refiner.lastPolishFailed
         appState.phase = .reviewing
         appState.transcript = TranscriptSnapshot()
         appState.silenceCountdown = nil
@@ -762,7 +766,7 @@ final class DictationController {
         overlayPanel.allowsKeyFocus = true
 
         reviewTimer?.invalidate()
-        let seconds = max(0.5, settings.reviewSeconds)
+        let seconds = activeReviewSeconds
         reviewTimer = Timer.scheduledTimer(withTimeInterval: seconds, repeats: false) { [weak self] _ in
             guard let self, self.sessionGeneration == generation else { return }
             // Auto-dismiss with no edit made — already injected at review
@@ -807,6 +811,7 @@ final class DictationController {
 
         appState.reviewText = text
         appState.reviewAwaitingInsert = true
+        appState.reviewPolishFailed = refiner.lastPolishFailed
         appState.phase = .reviewing
         appState.transcript = TranscriptSnapshot()
         appState.silenceCountdown = nil
@@ -815,6 +820,16 @@ final class DictationController {
         overlayPanel.allowsKeyFocus = true
 
         armReviewCountdown(generation: generation)
+    }
+
+    /// The active Polish preset's own review duration when it opts in,
+    /// otherwise the global setting — read fresh each time a review starts
+    /// or its countdown (re)arms, so a preset switch mid-flight can't leave
+    /// a stale duration behind.
+    private var activeReviewSeconds: TimeInterval {
+        let preset = presets.selected
+        let seconds = preset.reviewOverrideEnabled ? preset.reviewSeconds : settings.reviewSeconds
+        return max(0.5, seconds)
     }
 
     /// Cancels the review's auto-dismiss/auto-insert timers. Fired once the
@@ -833,7 +848,7 @@ final class DictationController {
     /// reaches zero.
     private func armReviewCountdown(generation: UInt64) {
         reviewCountdownTimer?.invalidate()
-        let seconds = max(0.5, settings.reviewSeconds)
+        let seconds = activeReviewSeconds
         reviewCountdownDeadline = Date().addingTimeInterval(seconds)
         appState.reviewCountdown = seconds
         reviewCountdownTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
@@ -929,6 +944,14 @@ final class DictationController {
         dismissReview()
     }
 
+    /// Folds a review-box edit into the vocabulary when it looks like a
+    /// single mishearing correction rather than a larger rewrite — see
+    /// `CorrectionLearner`. Shared by both review modes' correction paths.
+    private func learnFromCorrectionIfSmall(original: String, corrected: String) {
+        guard let candidate = CorrectionLearner.detectSubstitution(original: original, corrected: corrected) else { return }
+        VocabularyStore.shared.learnFromCorrection(oldTerm: candidate.oldTerm, newTerm: candidate.newTerm)
+    }
+
     /// Applies the user's action from the review editor — semantics differ by
     /// which mode produced the current review (see `activeReviewMode`).
     func applyReview(corrected: String) {
@@ -962,6 +985,7 @@ final class DictationController {
             corrected: corrected,
             backend: reviewBackend
         )
+        learnFromCorrectionIfSmall(original: original, corrected: corrected)
 
         if let id = reviewHistoryID {
             HistoryStore.shared.updateCorrection(id: id, corrected: corrected)
@@ -1030,6 +1054,7 @@ final class DictationController {
                     corrected: corrected,
                     backend: backend
                 )
+                self.learnFromCorrectionIfSmall(original: original, corrected: corrected)
                 HistoryStore.shared.updateCorrection(id: recordID, corrected: corrected)
             }
 

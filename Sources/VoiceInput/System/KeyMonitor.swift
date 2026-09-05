@@ -116,10 +116,15 @@ struct HotkeyShortcut: Equatable {
         return parts.joined()
     }
 
+    /// Prefers the keyCode-based table over the modifier-transformed
+    /// character — see the identical fix in `ShortcutRecorderButton` for why
+    /// (Control/Option can turn `fallback` into a control character rather
+    /// than the letter that was actually pressed).
     static func keyName(for keyCode: UInt16, fallback: String) -> String {
+        if let known = knownKeyNames[keyCode] { return known }
         let trimmed = fallback.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !trimmed.isEmpty { return trimmed.uppercased() }
-        return knownKeyNames[keyCode] ?? "#\(keyCode)"
+        let isPrintable = !trimmed.isEmpty && trimmed.unicodeScalars.allSatisfy { !CharacterSet.controlCharacters.contains($0) }
+        return isPrintable ? trimmed.uppercased() : "#\(keyCode)"
     }
 
     private static let knownKeyNames: [UInt16: String] = [
@@ -132,7 +137,8 @@ struct HotkeyShortcut: Equatable {
        45: "N",  46: "M",  47: ".",  48: "Tab",49: "Space", 51: "Delete",
        53: "Esc",76: "Enter",96: "F5",97: "F6",98: "F7",99: "F3",
       100: "F8",101: "F9",103: "F11",109: "F10",111: "F12",
-      118: "F4",122: "F1",120: "F2"
+      118: "F4",122: "F1",120: "F2",
+      123: "←",124: "→",125: "↓",126: "↑"
     ]
 }
 

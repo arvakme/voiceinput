@@ -71,17 +71,14 @@ enum TranscriptionFactory {
             return SonioxRealtimeSession(settings: settings, vocabulary: vocabulary)
         case (.soniox, .openAICompatible):
             return SonioxAsyncSession(settings: settings, vocabulary: vocabulary)
-        case (.openai, .sonioxRealtime):
-            return OpenAIRealtimeSession(settings: settings, vocabulary: vocabulary)
-        case (.openai, .openAICompatible):
-            return HTTPTranscriptionSession(settings: settings, vocabulary: vocabulary)
-        case (.qwen, .sonioxRealtime), (.qwen, .openAICompatible):
-            // Qwen has no realtime session yet — always batch, even if
-            // asrBackend is still (or gets set to) .sonioxRealtime (e.g. a
+        case (.doubao, .sonioxRealtime), (.doubao, .openAICompatible):
+            // Doubao has no batch session yet — always realtime, even if
+            // asrBackend is still (or gets set to) .openAICompatible (e.g. a
             // stale value carried over from a previously-selected provider).
-            // The Providers tab hides the Mode picker for Qwen so a user can't
-            // reach this from the UI, but the fallback keeps it crash-safe.
-            return QwenChatASRSession(settings: settings, vocabulary: vocabulary)
+            // The Providers tab hides the Mode picker for Doubao so a user
+            // can't reach this from the UI, but the fallback keeps it
+            // crash-safe (see `VoiceProvider.forcedBackend`).
+            return DoubaoRealtimeSession(settings: settings, vocabulary: vocabulary)
         }
     }
 }

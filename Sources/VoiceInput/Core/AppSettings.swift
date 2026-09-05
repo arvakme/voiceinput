@@ -29,14 +29,23 @@ enum ASRBackend: String, CaseIterable {
 /// Which vendor performs speech recognition. Both support realtime AND batch.
 enum VoiceProvider: String, CaseIterable {
     case soniox
-    case openai
-    case qwen
+    case doubao
 
     var displayName: String {
         switch self {
         case .soniox: return "Soniox"
-        case .openai: return "OpenAI"
-        case .qwen:   return "Qwen"
+        case .doubao: return "Doubao"
+        }
+    }
+
+    /// A provider with only one working session mode forces that mode
+    /// regardless of the user's `ASRBackend` picker: Doubao has no batch
+    /// session yet (realtime only). `nil` means both modes are real,
+    /// user-selectable options.
+    var forcedBackend: ASRBackend? {
+        switch self {
+        case .doubao: return .sonioxRealtime
+        case .soniox: return nil
         }
     }
 }
@@ -129,15 +138,10 @@ final class AppSettings: ObservableObject {
         static let asrBackend                   = "asrBackend"
         static let voiceProvider                = "voiceProvider"
         static let sonioxAsyncModel             = "sonioxAsyncModel"
-        static let openAIRealtimeModel          = "openAIRealtimeModel"
         static let sonioxAPIKey                 = "sonioxAPIKey"
         static let sonioxModel                  = "sonioxModel"
-        static let httpASRBaseURL               = "httpASRBaseURL"
-        static let httpASRAPIKey                = "httpASRAPIKey"
-        static let httpASRModel                 = "httpASRModel"
-        static let qwenBaseURL                   = "qwenBaseURL"
-        static let qwenAPIKey                    = "qwenAPIKey"
-        static let qwenModel                     = "qwenModel"
+        static let doubaoAPIKey                  = "doubaoAPIKey"
+        static let doubaoResourceId              = "doubaoResourceId"
         static let polishEnabled                = "polishEnabled"
         static let polishBaseURL                = "polishBaseURL"
         static let polishAPIKey                 = "polishAPIKey"
@@ -213,34 +217,15 @@ final class AppSettings: ObservableObject {
         if d.object(forKey: Key.asrBackend) == nil            { d.set(ASRBackend.sonioxRealtime.rawValue, forKey: Key.asrBackend) }
         if d.object(forKey: Key.voiceProvider) == nil {
             d.set(VoiceProvider.soniox.rawValue, forKey: Key.voiceProvider)
-            // One-time migration from the URL-sniffing era: Soniox config that
-            // lived in the OpenAI-compatible fields moves to its own keys.
-            let oldURL = d.string(forKey: Key.httpASRBaseURL) ?? ""
-            if oldURL.lowercased().contains("soniox") {
-                let oldModel = d.string(forKey: Key.httpASRModel) ?? ""
-                if oldModel.lowercased().hasPrefix("stt-") {
-                    d.set(oldModel, forKey: Key.sonioxAsyncModel)
-                }
-                d.set("https://api.openai.com/v1", forKey: Key.httpASRBaseURL)
-                d.set("gpt-4o-mini-transcribe", forKey: Key.httpASRModel)
-                if d.string(forKey: Key.httpASRAPIKey) == d.string(forKey: Key.sonioxAPIKey) {
-                    d.set("", forKey: Key.httpASRAPIKey)
-                }
-            }
         }
         if d.object(forKey: Key.sonioxAsyncModel) == nil      { d.set("stt-async-v5", forKey: Key.sonioxAsyncModel) }
-        if d.object(forKey: Key.openAIRealtimeModel) == nil   { d.set("gpt-4o-mini-transcribe", forKey: Key.openAIRealtimeModel) }
         if d.object(forKey: Key.sonioxAPIKey) == nil          { d.set("", forKey: Key.sonioxAPIKey) }
         if d.object(forKey: Key.sonioxModel) == nil           { d.set("stt-rt-v5", forKey: Key.sonioxModel) }
         // v5 (GA 2026-06-16) replaces v4 — better accuracy + translation, same
         // API. v4 retires 2026-06-30. Move anyone still on the v4 default up.
         if d.string(forKey: Key.sonioxModel) == "stt-rt-v4"   { d.set("stt-rt-v5", forKey: Key.sonioxModel) }
-        if d.object(forKey: Key.httpASRBaseURL) == nil        { d.set("https://api.openai.com/v1", forKey: Key.httpASRBaseURL) }
-        if d.object(forKey: Key.httpASRAPIKey) == nil         { d.set("", forKey: Key.httpASRAPIKey) }
-        if d.object(forKey: Key.httpASRModel) == nil          { d.set("gpt-4o-mini-transcribe", forKey: Key.httpASRModel) }
-        if d.object(forKey: Key.qwenBaseURL) == nil           { d.set("https://dashscope.aliyuncs.com/compatible-mode/v1", forKey: Key.qwenBaseURL) }
-        if d.object(forKey: Key.qwenAPIKey) == nil            { d.set("", forKey: Key.qwenAPIKey) }
-        if d.object(forKey: Key.qwenModel) == nil             { d.set("qwen3-asr-flash", forKey: Key.qwenModel) }
+        if d.object(forKey: Key.doubaoAPIKey) == nil          { d.set("", forKey: Key.doubaoAPIKey) }
+        if d.object(forKey: Key.doubaoResourceId) == nil      { d.set("volc.seedasr.sauc.duration", forKey: Key.doubaoResourceId) }
         if d.object(forKey: Key.polishEnabled) == nil         { d.set(true, forKey: Key.polishEnabled) }
         if d.object(forKey: Key.polishBaseURL) == nil         { d.set("https://openrouter.ai/api/v1", forKey: Key.polishBaseURL) }
         if d.object(forKey: Key.polishAPIKey) == nil          { d.set("", forKey: Key.polishAPIKey) }
@@ -392,43 +377,20 @@ final class AppSettings: ObservableObject {
         didSet { defaults.set(sonioxModel, forKey: Key.sonioxModel) }
     }
 
-    @Published var httpASRBaseURL: String = {
-        let v = UserDefaults.standard.string(forKey: Key.httpASRBaseURL) ?? "https://api.openai.com/v1"
-        return v.isEmpty ? "https://api.openai.com/v1" : v
+    /// Doubao (Volcengine "豆包语音识别大模型") bidirectional streaming ASR.
+    /// New-console auth: a single `X-Api-Key` bearer value — see
+    /// `DoubaoRealtimeSession`.
+    @Published var doubaoAPIKey: String = UserDefaults.standard.string(forKey: Key.doubaoAPIKey) ?? "" {
+        didSet { defaults.set(doubaoAPIKey, forKey: Key.doubaoAPIKey) }
+    }
+
+    /// `X-Api-Resource-Id` — selects model generation and billing shape
+    /// (e.g. `volc.seedasr.sauc.duration` = ASR 2.0, hourly resource pack).
+    @Published var doubaoResourceId: String = {
+        let v = UserDefaults.standard.string(forKey: Key.doubaoResourceId) ?? "volc.seedasr.sauc.duration"
+        return v.isEmpty ? "volc.seedasr.sauc.duration" : v
     }() {
-        didSet { defaults.set(httpASRBaseURL, forKey: Key.httpASRBaseURL) }
-    }
-
-    @Published var httpASRAPIKey: String = UserDefaults.standard.string(forKey: Key.httpASRAPIKey) ?? "" {
-        didSet { defaults.set(httpASRAPIKey, forKey: Key.httpASRAPIKey) }
-    }
-
-    @Published var httpASRModel: String = {
-        let v = UserDefaults.standard.string(forKey: Key.httpASRModel) ?? "gpt-4o-mini-transcribe"
-        return v.isEmpty ? "gpt-4o-mini-transcribe" : v
-    }() {
-        didSet { defaults.set(httpASRModel, forKey: Key.httpASRModel) }
-    }
-
-    /// Qwen3-ASR (Alibaba DashScope) base URL — an OpenAI-compatible gateway,
-    /// but ASR is a chat-completions request with embedded audio, not
-    /// `/audio/transcriptions` (see `QwenChatASRSession`).
-    @Published var qwenBaseURL: String = {
-        let v = UserDefaults.standard.string(forKey: Key.qwenBaseURL) ?? "https://dashscope.aliyuncs.com/compatible-mode/v1"
-        return v.isEmpty ? "https://dashscope.aliyuncs.com/compatible-mode/v1" : v
-    }() {
-        didSet { defaults.set(qwenBaseURL, forKey: Key.qwenBaseURL) }
-    }
-
-    @Published var qwenAPIKey: String = UserDefaults.standard.string(forKey: Key.qwenAPIKey) ?? "" {
-        didSet { defaults.set(qwenAPIKey, forKey: Key.qwenAPIKey) }
-    }
-
-    @Published var qwenModel: String = {
-        let v = UserDefaults.standard.string(forKey: Key.qwenModel) ?? "qwen3-asr-flash"
-        return v.isEmpty ? "qwen3-asr-flash" : v
-    }() {
-        didSet { defaults.set(qwenModel, forKey: Key.qwenModel) }
+        didSet { defaults.set(doubaoResourceId, forKey: Key.doubaoResourceId) }
     }
 
     // MARK: - Refinement
@@ -562,11 +524,6 @@ final class AppSettings: ObservableObject {
     /// Soniox batch model for "Just transcribe" mode.
     @Published var sonioxAsyncModel: String = UserDefaults.standard.string(forKey: Key.sonioxAsyncModel) ?? "stt-async-v5" {
         didSet { defaults.set(sonioxAsyncModel, forKey: Key.sonioxAsyncModel) }
-    }
-
-    /// OpenAI realtime transcription model (wss intent=transcription session).
-    @Published var openAIRealtimeModel: String = UserDefaults.standard.string(forKey: Key.openAIRealtimeModel) ?? "gpt-4o-mini-transcribe" {
-        didSet { defaults.set(openAIRealtimeModel, forKey: Key.openAIRealtimeModel) }
     }
 
     /// Live Captions: translation target (ISO code, e.g. "zh").

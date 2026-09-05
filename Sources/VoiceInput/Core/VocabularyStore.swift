@@ -9,6 +9,29 @@ struct VocabularyEntry: Codable, Identifiable, Equatable {
     var term: String
     /// Common mishearings, comma-separated. May be empty.
     var hints: String
+    /// True for entries `VocabularyStore.learnFromCorrection` added on its
+    /// own from a small review-box edit, rather than one you typed in by
+    /// hand — surfaced in the Vocabulary tab so a bad auto-guess is easy to
+    /// spot and delete.
+    var autoLearned: Bool = false
+
+    private enum CodingKeys: String, CodingKey { case id, term, hints, autoLearned }
+
+    init(id: UUID = UUID(), term: String, hints: String, autoLearned: Bool = false) {
+        self.id = id
+        self.term = term
+        self.hints = hints
+        self.autoLearned = autoLearned
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        term = try container.decode(String.self, forKey: .term)
+        hints = try container.decode(String.self, forKey: .hints)
+        // Missing for every entry saved before this field existed.
+        autoLearned = try container.decodeIfPresent(Bool.self, forKey: .autoLearned) ?? false
+    }
 }
 
 // MARK: - VocabularyStore
@@ -37,6 +60,12 @@ final class VocabularyStore: ObservableObject {
 
     private static let maxSonioxTerms = 500
     private static let maxSonioxCharBudget = 6000
+
+    /// Doubao's bidirectional-streaming hotword list is capped at 100 tokens
+    /// total (vs. Soniox's much larger session budget) — keep only the
+    /// highest-priority terms.
+    private static let maxDoubaoTerms = 30
+    private static let maxDoubaoCharBudget = 90
 
     private static let maxPromptLines = 60
     private static let maxPromptChars = 2000
@@ -112,6 +141,16 @@ final class VocabularyStore: ObservableObject {
     /// for CJK) and capped so the context payload never triggers Soniox's
     /// ~8,000-token session limit.
     var sonioxTerms: [String] {
+        rankedTerms(maxCount: Self.maxSonioxTerms, maxCharBudget: Self.maxSonioxCharBudget)
+    }
+
+    /// Same manual-first, dedupe-then-cap ranking as `sonioxTerms`, but
+    /// trimmed to Doubao's much tighter 100-token hotword budget.
+    var doubaoHotwords: [String] {
+        rankedTerms(maxCount: Self.maxDoubaoTerms, maxCharBudget: Self.maxDoubaoCharBudget)
+    }
+
+    private func rankedTerms(maxCount: Int, maxCharBudget: Int) -> [String] {
         let manual = entries
             .map { $0.term.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
@@ -121,10 +160,10 @@ final class VocabularyStore: ObservableObject {
         var totalChars = 0
 
         for term in manual + importedTerms {
-            guard result.count < Self.maxSonioxTerms else { break }
+            guard result.count < maxCount else { break }
             let key = Self.dedupeKey(for: term)
             guard seen.insert(key).inserted else { continue }
-            guard totalChars + term.count <= Self.maxSonioxCharBudget else { break }
+            guard totalChars + term.count <= maxCharBudget else { break }
             result.append(term)
             totalChars += term.count
         }
@@ -198,5 +237,28 @@ final class VocabularyStore: ObservableObject {
     func update(_ entry: VocabularyEntry) {
         guard let idx = entries.firstIndex(where: { $0.id == entry.id }) else { return }
         entries[idx] = entry
+    }
+
+    /// Called with a small, word/phrase-level review-box edit (see
+    /// `CorrectionLearner`) — folds it into the vocabulary so the same
+    /// mishearing is corrected automatically next time. Merges into an
+    /// existing entry for `newTerm` when one exists rather than creating a
+    /// duplicate row; marks brand-new entries `autoLearned` so they're
+    /// visibly distinct from ones you typed in yourself.
+    func learnFromCorrection(oldTerm: String, newTerm: String) {
+        let old = oldTerm.trimmingCharacters(in: .whitespacesAndNewlines)
+        let new = newTerm.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !old.isEmpty, !new.isEmpty, old != new else { return }
+
+        let key = Self.dedupeKey(for: new)
+        if let idx = entries.firstIndex(where: { Self.dedupeKey(for: $0.term) == key }) {
+            let existingHints = entries[idx].hints
+                .split(separator: ",")
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+            guard !existingHints.contains(where: { $0.caseInsensitiveCompare(old) == .orderedSame }) else { return }
+            entries[idx].hints = existingHints.isEmpty ? old : existingHints.joined(separator: ", ") + ", " + old
+        } else {
+            entries.append(VocabularyEntry(term: new, hints: old, autoLearned: true))
+        }
     }
 }

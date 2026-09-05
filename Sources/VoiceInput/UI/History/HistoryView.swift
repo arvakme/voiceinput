@@ -514,12 +514,31 @@ private struct HistoryDetailView: View {
                 .font(.system(size: 16, weight: .semibold))
                 .foregroundStyle(Theme.textPrimary)
             HStack(spacing: 8) {
-                metaChip(record.backend, system: "cpu")
+                metaChip(Self.backendDisplayName(record.backend), system: "cpu")
                 metaChip(HistoryFormat.duration(record.durationSeconds), system: "clock")
                 metaChip(record.injected ? "Injected" : "Not injected",
                          system: record.injected ? "checkmark.circle" : "xmark.circle")
             }
         }
+    }
+
+    /// `record.backend` is the raw `"<voiceProvider>/<asrBackend>"` string
+    /// persisted at dictation time (see `DictationController.sessionBackend`)
+    /// — every other label in this view goes through a `.displayName`, so
+    /// resolve this one too instead of showing the enum's `rawValue` verbatim.
+    /// Records from a provider that's since been removed (e.g. old
+    /// "openai/…" history) fall back to the raw string: it's inert historical
+    /// data, not something worth losing.
+    private static func backendDisplayName(_ raw: String) -> String {
+        let parts = raw.split(separator: "/", maxSplits: 1)
+        guard let providerPart = parts.first,
+              let provider = VoiceProvider(rawValue: String(providerPart)) else {
+            return raw
+        }
+        guard parts.count > 1, let backend = ASRBackend(rawValue: String(parts[1])) else {
+            return provider.displayName
+        }
+        return "\(provider.displayName) · \(backend.chipLabel)"
     }
 
     private func metaChip(_ text: String, system: String) -> some View {

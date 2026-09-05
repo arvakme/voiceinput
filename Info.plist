@@ -14,6 +14,17 @@
 	<string>VoiceInput</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>com.zhijie.VoiceInput</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>voiceinput</string>
+			</array>
+		</dict>
+	</array>
 	<key>CFBundleShortVersionString</key>
 	<string>1.1.1</string>
 	<key>CFBundleVersion</key>

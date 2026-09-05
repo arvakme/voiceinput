@@ -13,9 +13,9 @@ import os.log
 ///   4. `GET {base}/transcriptions/{id}/transcript` → `{"text": …}`
 /// plus best-effort `DELETE` cleanup of the file and transcription.
 ///
-/// Like `HTTPTranscriptionSession`, nothing streams during recording:
-/// `onTranscript`/`onUtteranceEnd` stay silent until `stop()` resolves, so
-/// hands-free silence auto-stop is unavailable on this backend.
+/// Nothing streams during recording: `onTranscript`/`onUtteranceEnd` stay
+/// silent until `stop()` resolves, so hands-free silence auto-stop is
+/// unavailable on this backend.
 final class SonioxAsyncSession: TranscriptionSession {
     // MARK: - TranscriptionSession callbacks
 
