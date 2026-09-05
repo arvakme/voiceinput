@@ -152,6 +152,7 @@ final class AppSettings: ObservableObject {
         static let translateAPIKey              = "translateAPIKey"
         static let translateModel               = "translateModel"
         static let polishReasoningEffort        = "polishReasoningEffort"
+        static let polishOpenRouterSort         = "polishOpenRouterSort"
         static let vocabularyJSON               = "vocabularyJSON"
         static let rimeImportEnabled            = "rimeImportEnabled"
         static let voiceBoxOpacity              = "voiceBoxOpacity"
@@ -236,6 +237,7 @@ final class AppSettings: ObservableObject {
         if d.object(forKey: Key.translateAPIKey) == nil       { d.set("", forKey: Key.translateAPIKey) }
         if d.object(forKey: Key.translateModel) == nil        { d.set("hy-mt2-1.8b-translate:latest", forKey: Key.translateModel) }
         if d.object(forKey: Key.polishReasoningEffort) == nil { d.set("low", forKey: Key.polishReasoningEffort) }
+        if d.object(forKey: Key.polishOpenRouterSort) == nil  { d.set("", forKey: Key.polishOpenRouterSort) }
         if d.object(forKey: Key.vocabularyJSON) == nil        { d.set("[]", forKey: Key.vocabularyJSON) }
         if d.object(forKey: Key.rimeImportEnabled) == nil     { d.set(true, forKey: Key.rimeImportEnabled) }
         if d.object(forKey: Key.voiceBoxOpacity) == nil       { d.set(0.25, forKey: Key.voiceBoxOpacity) }
@@ -609,6 +611,15 @@ final class AppSettings: ObservableObject {
     /// OpenAI-compatible endpoints (OpenAI, Cerebras, …) get "reasoning_effort".
     @Published var polishReasoningEffort: String = UserDefaults.standard.string(forKey: Key.polishReasoningEffort) ?? "low" {
         didSet { defaults.set(polishReasoningEffort, forKey: Key.polishReasoningEffort) }
+    }
+
+    /// OpenRouter-only: `""` (no preference), `"throughput"` (fastest
+    /// backing provider for this model), or `"price"` (cheapest). Sent as
+    /// `provider: {"sort": …}` — different OpenRouter-hosted providers for
+    /// the same open model can differ a lot in both, and OpenRouter's own
+    /// default balances the two rather than optimizing for either.
+    @Published var polishOpenRouterSort: String = UserDefaults.standard.string(forKey: Key.polishOpenRouterSort) ?? "" {
+        didSet { defaults.set(polishOpenRouterSort, forKey: Key.polishOpenRouterSort) }
     }
 
     /// Whether the voice box is collapsed into its compact capsule form.

@@ -18,14 +18,24 @@ final class Refiner {
         self.settings = settings
         self.vocabulary = vocabulary
         self.presets = presets
+        self.activePreset = presets.selected
     }
 
-    /// Whether the polish step in the most recent `refine()` call fell back
-    /// to unpolished text — a network/API failure, not "nothing to polish".
-    /// Read this right after `refine()`'s completion fires (main thread,
-    /// same as the completion itself) to show the user their text skipped
-    /// polish rather than letting the never-fail fallback look silent.
-    private(set) var lastPolishFailed = false
+    /// Non-nil when the polish step in the most recent `refine()` call fell
+    /// back to unpolished text — a network/API failure, not "nothing to
+    /// polish" — holding whatever the endpoint said went wrong. Read this
+    /// right after `refine()`'s completion fires (main thread, same as the
+    /// completion itself) to show the user their text skipped polish rather
+    /// than letting the never-fail fallback look silent.
+    private(set) var lastPolishFailureReason: String?
+    var lastPolishFailed: Bool { lastPolishFailureReason != nil }
+
+    /// The preset `refine()` is currently using — captured once per call
+    /// (see `refine(_:preset:completion:)`) rather than read live from
+    /// `presets.selected`, so switching presets from the voice-box chip
+    /// mid-recording can't retroactively change how the transcript already
+    /// in flight gets polished.
+    private var activePreset: PolishPreset
 
     // MARK: - Cancellation
 
@@ -46,11 +56,18 @@ final class Refiner {
     /// Runs polish (if enabled) then translate (if enabled) sequentially.
     /// Completion always fires on main thread with the best available text.
     /// Never throws to caller; any step failure is logged and skipped.
-    func refine(_ text: String, completion: @escaping (String) -> Void) {
+    ///
+    /// - Parameter preset: The Polish preset this dictation should use,
+    ///   normally captured by the caller at session start (see
+    ///   `DictationController.beginSession`). Defaults to whatever is
+    ///   currently selected for call sites that don't care about the
+    ///   lock-in (e.g. `testPolish`).
+    func refine(_ text: String, preset: PolishPreset? = nil, completion: @escaping (String) -> Void) {
         taskLock.lock()
         cancelled = false
         taskLock.unlock()
-        lastPolishFailed = false
+        lastPolishFailureReason = nil
+        activePreset = preset ?? presets.selected
 
         var steps: [Step] = []
         if settings.polishEnabled    { steps.append(.polish) }
@@ -116,8 +133,10 @@ final class Refiner {
                 self?.taskLock.unlock()
                 if case RefinerError.cancelled = error, wasCancelled { return }
 
-                if case .polish = step { self?.lastPolishFailed = true }
-                Log.refine.error("\(step.label) failed, continuing with best text: \(error.localizedDescription)")
+                if case .polish = step {
+                    self?.lastPolishFailureReason = error.localizedDescription
+                }
+                Log.refine.error("\(step.label) failed, continuing with best text: \(error.localizedDescription, privacy: .public)")
                 completion(input)
             }
         }
@@ -188,12 +207,22 @@ final class Refiner {
         // "reasoning_effort" string. "off" sends neither.
         if case .polish = step {
             let effort = settings.polishReasoningEffort
+            let isOpenRouter = config.baseURL.lowercased().contains("openrouter")
             if effort != "off" {
-                if config.baseURL.lowercased().contains("openrouter") {
+                if isOpenRouter {
                     body["reasoning"] = ["effort": effort]
                 } else {
                     body["reasoning_effort"] = effort
                 }
+            }
+
+            // OpenRouter-only: which of the (possibly several) providers
+            // hosting this open model to prefer. Only meaningful there — a
+            // direct Cerebras/OpenAI-style endpoint has exactly one backing
+            // provider (itself), nothing to route between.
+            let sort = settings.polishOpenRouterSort
+            if isOpenRouter, !sort.isEmpty {
+                body["provider"] = ["sort": sort]
             }
         }
 
@@ -272,8 +301,29 @@ final class Refiner {
                 return
             }
 
+            // `privacy: .public` deliberately — this is the endpoint's own
+            // response to OUR request, never user dictation content, and
+            // without it every diagnostic here is unreadable `<private>` in
+            // Console.
             if let raw = String(data: data, encoding: .utf8) {
-                Log.refine.debug("\(step.label) raw response: \(raw)")
+                Log.refine.debug("\(step.label) raw response: \(raw, privacy: .public)")
+            }
+
+            // A non-2xx status with a body shaped like {"error": {...}} would
+            // otherwise fall straight into the `choices` guard below and log
+            // as an opaque "failed to parse" — surface the endpoint's own
+            // error message instead, so a bad model name, an over-limit
+            // max_tokens, or an expired key says so plainly.
+            if let httpResponse = response as? HTTPURLResponse, !(200..<300).contains(httpResponse.statusCode) {
+                let apiMessage = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])
+                    .flatMap { $0["error"] as? [String: Any] }
+                    .flatMap { $0["message"] as? String }
+                let message = apiMessage ?? String(data: data, encoding: .utf8) ?? "no body"
+                Log.refine.error("\(step.label) HTTP \(httpResponse.statusCode, privacy: .public): \(message, privacy: .public)")
+                DispatchQueue.main.async {
+                    completion(.failure(RefinerError.apiError(step.label, httpResponse.statusCode, message)))
+                }
+                return
             }
 
             guard
@@ -328,7 +378,7 @@ final class Refiner {
     private func endpointConfig(for step: Step) -> EndpointConfig {
         switch step {
         case .polish:
-            let preset = presets.selected
+            let preset = activePreset
             guard preset.modelOverrideEnabled else {
                 return EndpointConfig(
                     baseURL: settings.polishBaseURL,
@@ -366,9 +416,9 @@ final class Refiner {
     /// dictation as much as Daily).
     private func buildPolishPrompt() -> String {
         let vocabSection = vocabulary.promptSection
-        guard !vocabSection.isEmpty else { return presets.selected.systemPrompt }
+        guard !vocabSection.isEmpty else { return activePreset.systemPrompt }
 
-        return presets.selected.systemPrompt + """
+        return activePreset.systemPrompt + """
 
 
             VOCABULARY:
@@ -459,6 +509,11 @@ final class Refiner {
         case requestSerializationFailed(String)
         case rateLimited(String)
         case truncated(String)
+        /// A non-2xx HTTP response the endpoint itself explained — a bad
+        /// model name, an over-limit `max_tokens`, an expired key, etc.
+        /// Distinct from `.invalidResponse`, which means the response
+        /// couldn't even be understood well enough to say why it failed.
+        case apiError(String, Int, String)
         case cancelled
 
         var errorDescription: String? {
@@ -469,6 +524,7 @@ final class Refiner {
             case .requestSerializationFailed(let step):   return "\(step): failed to serialize request"
             case .rateLimited(let step):                  return "\(step): rate limited (429)"
             case .truncated(let step):                    return "\(step): response truncated (finish_reason=length)"
+            case .apiError(let step, let status, let message): return "\(step): HTTP \(status) — \(message)"
             case .cancelled:                              return "Refiner cancelled"
             }
         }

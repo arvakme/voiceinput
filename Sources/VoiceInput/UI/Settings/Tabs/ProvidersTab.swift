@@ -183,6 +183,21 @@ struct ProvidersTab: View {
                 .labelsHidden()
                 .frame(width: 240)
             }
+            if settings.polishBaseURL.lowercased().contains("openrouter") {
+                InlineRow(
+                    title: "Provider routing",
+                    help: "Which backing provider OpenRouter picks for this open-weight model — they differ in price and speed for the same model."
+                ) {
+                    Picker("", selection: $settings.polishOpenRouterSort) {
+                        Text("Default").tag("")
+                        Text("Fastest").tag("throughput")
+                        Text("Cheapest").tag("price")
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .frame(width: 220)
+                }
+            }
             Hairline()
             TestButton(title: "Test Polish", outcome: polishOutcome) {
                 runPolishTest()

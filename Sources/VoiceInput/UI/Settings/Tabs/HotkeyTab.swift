@@ -40,18 +40,8 @@ struct HotkeyTab: View {
                     help: "Click the field, then press the key combination you want (needs at least one modifier)."
                 ) {
                     ZStack(alignment: .leading) {
-                        ShortcutRecorder(
-                            keyCode: $settings.customHotkeyKeyCode,
-                            modifierFlags: $settings.customHotkeyModifierFlags,
-                            keyEquivalent: $settings.customHotkeyKeyEquivalent,
-                            isRecording: $isRecordingShortcut
-                        )
-                        .frame(height: 30)
-                        // Kept in the hit-test tree (this is what actually
-                        // captures the keystroke) but visually replaced by
-                        // the keycap row below it.
-                        .opacity(0.011)
-
+                        // Visual only — sits UNDERNEATH the recorder button,
+                        // never in the hit-test path.
                         KeycapRowView(
                             shortcut: HotkeyShortcut(
                                 keyCode: UInt16(max(0, min(settings.customHotkeyKeyCode, Int(UInt16.max)))),
@@ -60,7 +50,20 @@ struct HotkeyTab: View {
                             ),
                             isRecording: isRecordingShortcut
                         )
-                        .allowsHitTesting(false)
+
+                        // The real click/key-capture target. Must be the
+                        // TOPMOST view in this ZStack — an AppKit button
+                        // under a SwiftUI overlay does not reliably receive
+                        // clicks even with allowsHitTesting(false) on the
+                        // view above it, only when it's on top itself.
+                        ShortcutRecorder(
+                            keyCode: $settings.customHotkeyKeyCode,
+                            modifierFlags: $settings.customHotkeyModifierFlags,
+                            keyEquivalent: $settings.customHotkeyKeyEquivalent,
+                            isRecording: $isRecordingShortcut
+                        )
+                        .frame(height: 30)
+                        .opacity(0.011)
                     }
                     .frame(maxWidth: 280, alignment: .leading)
                 }

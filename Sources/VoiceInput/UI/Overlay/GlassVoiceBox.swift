@@ -29,6 +29,7 @@ final class HotkeyLabelModel: ObservableObject {
 struct GlassVoiceBox: View {
     @ObservedObject var state: AppState
     @ObservedObject var settings: AppSettings
+    @ObservedObject private var presetStore = PolishPresetStore.shared
 
     /// The Stop badge text (the user's hotkey display name) supplied by the
     /// AppDelegate via `OverlayPanel.updateHotkeyLabel`. Held by the panel and
@@ -101,7 +102,7 @@ struct GlassVoiceBox: View {
                     original: state.reviewText,
                     awaitingInsert: state.reviewAwaitingInsert,
                     countdown: state.reviewCountdown,
-                    polishFailed: state.reviewPolishFailed,
+                    polishFailureReason: state.reviewPolishFailureReason,
                     onEditStart: onReviewEditStart,
                     onApply: onApplyReview
                 )
@@ -475,20 +476,38 @@ struct GlassVoiceBox: View {
     // only) have an inert chip that always reads their forced mode
     // regardless of the (possibly stale) asrBackend value — matches the
     // Providers tab, which hides the Mode picker for them too.
+    private func cyclePreset() {
+        let presets = presetStore.presets
+        guard let idx = presets.firstIndex(where: { $0.id == presetStore.selectedPresetID }) else { return }
+        presetStore.selectedPresetID = presets[(idx + 1) % presets.count].id
+    }
+
     private var chips: some View {
         HStack(spacing: 6) {
-            Button {
-                guard settings.voiceProvider.forcedBackend == nil else { return }
-                settings.asrBackend = settings.asrBackend == .sonioxRealtime
-                    ? .openAICompatible : .sonioxRealtime
-            } label: {
-                FeatureChip(
-                    title: (settings.voiceProvider.forcedBackend ?? settings.asrBackend).chipLabel,
-                    active: (settings.voiceProvider.forcedBackend ?? settings.asrBackend) == .sonioxRealtime
-                )
+            // Providers with a `forcedBackend` (Doubao: realtime-only) have
+            // nothing to switch, so the Mode chip that used to sit here was
+            // permanently inert — removed rather than shown as dead weight.
+            // Soniox still has a real Realtime/Transcribe choice; reach it
+            // from the Providers settings tab.
+            Button { } label: {
+                FeatureChip(title: presetStore.selected.name, active: true)
             }
             .buttonStyle(.plain)
-            .help("Switch voice mode now: Realtime streams live words; Transcribe uploads once at stop. Applies immediately.")
+            .help("Click to cycle presets. Right-click to jump to one.")
+            .simultaneousGesture(TapGesture().onEnded { cyclePreset() })
+            .contextMenu {
+                ForEach(presetStore.presets) { preset in
+                    Button {
+                        presetStore.selectedPresetID = preset.id
+                    } label: {
+                        if preset.id == presetStore.selectedPresetID {
+                            Label(preset.name, systemImage: "checkmark")
+                        } else {
+                            Text(preset.name)
+                        }
+                    }
+                }
+            }
 
             Button { settings.polishEnabled.toggle() } label: {
                 FeatureChip(title: "Polish", active: settings.polishEnabled)
@@ -835,10 +854,11 @@ private struct ReviewEditorView: View {
     let original: String
     let awaitingInsert: Bool
     let countdown: Double?
-    /// True when `Refiner` fell back to unpolished text this session (a
-    /// network/API failure), so the reviewer isn't left thinking Polish
-    /// silently does nothing — see `AppState.reviewPolishFailed`.
-    let polishFailed: Bool
+    /// Non-nil when `Refiner` fell back to unpolished text this session (a
+    /// network/API failure), holding what the endpoint said went wrong, so
+    /// the reviewer isn't left thinking Polish silently does nothing — see
+    /// `AppState.reviewPolishFailureReason`.
+    let polishFailureReason: String?
     var onEditStart: () -> Void
     var onApply: (String) -> Void
 
@@ -848,13 +868,13 @@ private struct ReviewEditorView: View {
     init(original: String,
          awaitingInsert: Bool,
          countdown: Double?,
-         polishFailed: Bool,
+         polishFailureReason: String?,
          onEditStart: @escaping () -> Void,
          onApply: @escaping (String) -> Void) {
         self.original = original
         self.awaitingInsert = awaitingInsert
         self.countdown = countdown
-        self.polishFailed = polishFailed
+        self.polishFailureReason = polishFailureReason
         self.onEditStart = onEditStart
         self.onApply = onApply
         _text = State(initialValue: original)
@@ -880,10 +900,12 @@ private struct ReviewEditorView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            if polishFailed {
-                HStack(spacing: 5) {
+            if let polishFailureReason {
+                HStack(alignment: .top, spacing: 5) {
                     Image(systemName: "exclamationmark.triangle.fill")
-                    Text("Polish 未生效，这是原始转录")
+                    Text("Polish 未生效，这是原始转录 — \(polishFailureReason)")
+                        .lineLimit(2)
+                        .truncationMode(.tail)
                 }
                 .font(.system(size: 11, weight: .semibold))
                 .foregroundStyle(Color.orange)

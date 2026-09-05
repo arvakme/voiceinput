@@ -57,6 +57,8 @@ final class DictationController {
     // History capture (per session)
     private var sessionStartDate: Date?
     private var sessionBackend: String = ""
+    /// Snapshot of the Polish preset at `beginSession` — see `Refiner.activePreset`.
+    private var sessionPolishPreset: PolishPreset = PolishPresetStore.shared.selected
     /// Materialised once at session end, only when history + keep-audio are on.
     private var pendingAudioWAV: Data?
 
@@ -224,6 +226,10 @@ final class DictationController {
         // Capture session metadata for history.
         sessionStartDate = Date()
         sessionBackend = "\(settings.voiceProvider.rawValue)/\(settings.asrBackend.rawValue)"
+        // Locked in now so switching presets from the voice-box chip while
+        // THIS recording is still in progress can't retroactively change how
+        // it gets polished once it ends — see `Refiner.activePreset`.
+        sessionPolishPreset = presets.selected
         pendingAudioWAV = nil
 
         Log.app.info("beginSession kind=\(String(describing: kind))")
@@ -641,7 +647,7 @@ final class DictationController {
             appState.phase = .refining
             pendingBestTranscript = trimmed
 
-            refiner.refine(trimmed) { [weak self] refined in
+            refiner.refine(trimmed, preset: sessionPolishPreset) { [weak self] refined in
                 guard let self else { return }
                 guard self.sessionGeneration == generation else { return }
                 self.pendingBestTranscript = nil
@@ -757,7 +763,7 @@ final class DictationController {
 
         appState.reviewText = injectedText
         appState.reviewAwaitingInsert = false
-        appState.reviewPolishFailed = refiner.lastPolishFailed
+        appState.reviewPolishFailureReason = refiner.lastPolishFailureReason
         appState.phase = .reviewing
         appState.transcript = TranscriptSnapshot()
         appState.silenceCountdown = nil
@@ -811,7 +817,7 @@ final class DictationController {
 
         appState.reviewText = text
         appState.reviewAwaitingInsert = true
-        appState.reviewPolishFailed = refiner.lastPolishFailed
+        appState.reviewPolishFailureReason = refiner.lastPolishFailureReason
         appState.phase = .reviewing
         appState.transcript = TranscriptSnapshot()
         appState.silenceCountdown = nil
