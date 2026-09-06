@@ -34,10 +34,37 @@ struct VocabularyEntry: Codable, Identifiable, Equatable {
     }
 }
 
+struct VocabularySuggestion: Codable, Identifiable, Equatable {
+    var id: UUID = UUID()
+    let oldTerm: String
+    let newTerm: String
+    let source: VocabularyStore.LearningSource
+    var observations: Int = 1
+}
+
 // MARK: - VocabularyStore
 
 final class VocabularyStore: ObservableObject {
     static let shared = VocabularyStore()
+
+    enum LearningSource: String, Codable {
+        case userCorrection
+        case polish
+    }
+
+    private let injectedDefaults: UserDefaults?
+    private var preferenceDefaults: UserDefaults { injectedDefaults ?? .standard }
+
+    @Published var learningEnabled: Bool {
+        didSet { preferenceDefaults.set(learningEnabled, forKey: "vocabularyLearningEnabled") }
+    }
+    @Published private(set) var pendingCandidates: [VocabularySuggestion] {
+        didSet { persistSuggestions() }
+    }
+    private var ignoredTerms: Set<String> {
+        didSet { preferenceDefaults.set(Array(ignoredTerms).sorted(), forKey: "vocabularyIgnoredTerms") }
+    }
+
 
     /// All entries, persisted to `AppSettings.shared.vocabularyJSON` on every change.
     @Published var entries: [VocabularyEntry] {
@@ -70,9 +97,19 @@ final class VocabularyStore: ObservableObject {
     private static let maxPromptLines = 60
     private static let maxPromptChars = 2000
 
-    private init() {
-        entries = VocabularyStore.load()
-
+    init(defaults: UserDefaults? = nil, loadRimeCache: Bool = true) {
+        injectedDefaults = defaults
+        let preferences = defaults ?? .standard
+        learningEnabled = preferences.object(forKey: "vocabularyLearningEnabled") as? Bool ?? true
+        if let data = preferences.data(forKey: "vocabularySuggestionsJSON"),
+           let suggestions = try? JSONDecoder().decode([VocabularySuggestion].self, from: data) {
+            pendingCandidates = Array(suggestions.prefix(100))
+        } else {
+            pendingCandidates = []
+        }
+        ignoredTerms = Set(preferences.stringArray(forKey: "vocabularyIgnoredTerms") ?? [])
+        entries = VocabularyStore.load(defaults: defaults)
+        guard loadRimeCache else { return }
         RimeLexiconImporter.loadCachedResult { [weak self] cached in
             guard let self, let cached else { return }
             self.importedTerms = cached.terms
@@ -83,8 +120,10 @@ final class VocabularyStore: ObservableObject {
 
     // MARK: - Persistence
 
-    private static func load() -> [VocabularyEntry] {
-        let json = AppSettings.shared.vocabularyJSON
+    private static func load(defaults: UserDefaults?) -> [VocabularyEntry] {
+        let json: String
+        if let defaults { json = defaults.string(forKey: "vocabularyJSON") ?? "[]" }
+        else { json = AppSettings.shared.vocabularyJSON }
         guard
             let data = json.data(using: .utf8),
             let decoded = try? JSONDecoder().decode([VocabularyEntry].self, from: data)
@@ -99,7 +138,8 @@ final class VocabularyStore: ObservableObject {
             let data = try? JSONEncoder().encode(entries),
             let json = String(data: data, encoding: .utf8)
         else { return }
-        AppSettings.shared.vocabularyJSON = json
+        if let injectedDefaults { injectedDefaults.set(json, forKey: "vocabularyJSON") }
+        else { AppSettings.shared.vocabularyJSON = json }
     }
 
     // MARK: - Rime import
@@ -227,16 +267,72 @@ final class VocabularyStore: ObservableObject {
     // MARK: - Mutations
 
     func add(_ entry: VocabularyEntry) {
+        ignoredTerms.remove(Self.dedupeKey(for: entry.term))
         entries.append(entry)
     }
 
     func remove(at offsets: IndexSet) {
+        for index in offsets where entries.indices.contains(index) {
+            ignoredTerms.insert(Self.dedupeKey(for: entries[index].term))
+        }
         entries.remove(atOffsets: offsets)
     }
 
     func update(_ entry: VocabularyEntry) {
         guard let idx = entries.firstIndex(where: { $0.id == entry.id }) else { return }
         entries[idx] = entry
+    }
+
+    /// Called only after the user actually accepts/delivers a transcription.
+    /// User spelling corrections are stronger evidence than model rewrites;
+    /// model changes stay out of ASR/LLM prompts until explicitly approved.
+    @discardableResult
+    func observeCorrections(original: String, corrected: String, source: LearningSource) -> Int {
+        guard learningEnabled else { return 0 }
+        var added = 0
+        for candidate in CorrectionLearner.detectSubstitutions(original: original, corrected: corrected) {
+            let key = Self.dedupeKey(for: candidate.newTerm)
+            guard !ignoredTerms.contains(key) else { continue }
+            if source == .userCorrection, candidate.canLearnAutomatically {
+                let before = entries
+                learnFromCorrection(oldTerm: candidate.oldTerm, newTerm: candidate.newTerm)
+                pendingCandidates.removeAll { Self.dedupeKey(for: $0.newTerm) == key }
+                if before != entries { added += 1 }
+            } else {
+                // Repeated AI changes are observations, not confirmation.
+                // Never let a self-reinforcing model guess become a hotword.
+                if entries.contains(where: { Self.dedupeKey(for: $0.term) == key }) { continue }
+                if let index = pendingCandidates.firstIndex(where: {
+                    Self.dedupeKey(for: $0.newTerm) == key && $0.oldTerm.caseInsensitiveCompare(candidate.oldTerm) == .orderedSame
+                }) {
+                    pendingCandidates[index].observations = min(999, pendingCandidates[index].observations + 1)
+                } else if pendingCandidates.count < 100 {
+                    pendingCandidates.append(VocabularySuggestion(oldTerm: candidate.oldTerm,
+                        newTerm: candidate.newTerm, source: source))
+                    added += 1
+                }
+            }
+        }
+        return added
+    }
+
+    func acceptSuggestion(_ id: UUID) {
+        guard let suggestion = pendingCandidates.first(where: { $0.id == id }) else { return }
+        ignoredTerms.remove(Self.dedupeKey(for: suggestion.newTerm))
+        learnFromCorrection(oldTerm: suggestion.oldTerm, newTerm: suggestion.newTerm)
+        pendingCandidates.removeAll { $0.id == id }
+    }
+
+    func dismissSuggestion(_ id: UUID) {
+        guard let suggestion = pendingCandidates.first(where: { $0.id == id }) else { return }
+        let key = Self.dedupeKey(for: suggestion.newTerm)
+        ignoredTerms.insert(key)
+        pendingCandidates.removeAll { Self.dedupeKey(for: $0.newTerm) == key }
+    }
+
+    private func persistSuggestions() {
+        guard let data = try? JSONEncoder().encode(pendingCandidates) else { return }
+        preferenceDefaults.set(data, forKey: "vocabularySuggestionsJSON")
     }
 
     /// Called with a small, word/phrase-level review-box edit (see

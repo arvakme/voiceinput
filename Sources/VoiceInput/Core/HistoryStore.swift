@@ -55,9 +55,13 @@ final class HistoryStore: ObservableObject {
     private let fileManager = FileManager.default
     private var cancellables = Set<AnyCancellable>()
 
-    private init() {
+    private let directoryOverride: URL?
+
+    /// An explicit directory allows isolated storage tests without touching user data.
+    init(baseDirectory: URL? = nil, observesSettings: Bool = true) {
+        directoryOverride = baseDirectory
         loadInitial()
-        observeSettings()
+        if observesSettings { observeSettings() }
     }
 
     /// `historyMaxSessions` normally only prunes on the next `record()` call;
@@ -73,7 +77,7 @@ final class HistoryStore: ObservableObject {
             .receive(on: io)
             .sink { [weak self] maxSessions, maxDiskBytes in
                 guard let self else { return }
-                let current = self.readRecordsFromDisk()
+                guard let current = self.readRecordsFromDisk() else { return }
                 let pruned = self.applyRetentionLimits(to: current, maxSessions: maxSessions, maxDiskBytes: maxDiskBytes)
                 self.writeRecordsToDisk(pruned)
                 DispatchQueue.main.async {
@@ -97,6 +101,7 @@ final class HistoryStore: ObservableObject {
 
     /// `~/Library/Application Support/VoiceInput/`
     private var baseDirectory: URL {
+        if let directoryOverride { return directoryOverride }
         let appSupport = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
             ?? URL(fileURLWithPath: NSHomeDirectory())
                 .appendingPathComponent("Library/Application Support", isDirectory: true)
@@ -127,13 +132,16 @@ final class HistoryStore: ObservableObject {
     }
 
     /// Resolve the on-disk URL for a record's audio, if the record claims to
-    /// have one. This trusts `audioFilename` and does NOT touch the filesystem,
+    /// have one. Only basenames are accepted; this does NOT touch the filesystem,
     /// so it is safe to call from the main thread during SwiftUI rendering — a
     /// stalled or networked volume can make `fileExists` block and drop frames.
     /// If the file turns out to be missing, `AVAudioPlayer` load fails
     /// gracefully and the transport simply shows a zero-length track.
     func audioURL(for record: HistoryRecord) -> URL? {
-        guard let filename = record.audioFilename, !filename.isEmpty else { return nil }
+        guard let filename = record.audioFilename,
+              !filename.isEmpty, filename != ".", filename != "..",
+              !filename.contains("/"), !filename.contains("\\"),
+              !filename.contains("\0") else { return nil }
         return audioDirectory.appendingPathComponent(filename, isDirectory: false)
     }
 
@@ -144,7 +152,7 @@ final class HistoryStore: ObservableObject {
     private func loadInitial() {
         io.async { [weak self] in
             guard let self else { return }
-            let loaded = self.readRecordsFromDisk()
+            guard let loaded = self.readRecordsFromDisk() else { return }
             self.sweepOrphanedAudioFiles(referencedBy: loaded)
             let usage = self.totalAudioBytes(loaded)
             DispatchQueue.main.async {
@@ -182,11 +190,12 @@ final class HistoryStore: ObservableObject {
         }
     }
 
-    private func readRecordsFromDisk() -> [HistoryRecord] {
+    /// nil means unreadable/corrupt, never an empty history. Callers must stop
+    /// mutations and cleanup so recoverable transcripts and audio survive.
+    private func readRecordsFromDisk() -> [HistoryRecord]? {
         guard fileManager.fileExists(atPath: historyFileURL.path) else { return [] }
         do {
             let data = try Data(contentsOf: historyFileURL)
-            guard !data.isEmpty else { return [] }
             let decoder = JSONDecoder()
             decoder.dateDecodingStrategy = .iso8601
             let decoded = try decoder.decode([HistoryRecord].self, from: data)
@@ -194,7 +203,7 @@ final class HistoryStore: ObservableObject {
             return decoded.sorted { $0.date > $1.date }
         } catch {
             Log.app.error("History: failed to read history.json: \(error.localizedDescription, privacy: .public)")
-            return []
+            return nil
         }
     }
 
@@ -248,6 +257,7 @@ final class HistoryStore: ObservableObject {
 
         io.async { [weak self] in
             guard let self else { return }
+            guard var current = self.readRecordsFromDisk() else { return }
             self.ensureDirectories()
 
             // Write audio first; if that fails, fall back to a no-audio record.
@@ -273,7 +283,6 @@ final class HistoryStore: ObservableObject {
             }
 
             // Build the new list (newest first) and prune the overflow.
-            var current = self.readRecordsFromDisk()
             current.insert(effectiveRecord, at: 0)
             current.sort { $0.date > $1.date }
 
@@ -296,7 +305,7 @@ final class HistoryStore: ObservableObject {
     func updateCorrection(id: UUID, corrected: String) {
         io.async { [weak self] in
             guard let self else { return }
-            var current = self.readRecordsFromDisk()
+            guard var current = self.readRecordsFromDisk() else { return }
             guard let index = current.firstIndex(where: { $0.id == id }) else {
                 Log.app.info("History: updateCorrection found no record for id \(id, privacy: .public)")
                 return
@@ -329,7 +338,7 @@ final class HistoryStore: ObservableObject {
         guard !ids.isEmpty else { return }
         io.async { [weak self] in
             guard let self else { return }
-            var current = self.readRecordsFromDisk()
+            guard var current = self.readRecordsFromDisk() else { return }
             let toDelete = current.filter { ids.contains($0.id) }
             for record in toDelete {
                 self.deleteAudioFile(for: record)
@@ -349,7 +358,7 @@ final class HistoryStore: ObservableObject {
     func clearAll() {
         io.async { [weak self] in
             guard let self else { return }
-            let current = self.readRecordsFromDisk()
+            guard let current = self.readRecordsFromDisk() else { return }
             for record in current {
                 self.deleteAudioFile(for: record)
             }
@@ -370,7 +379,8 @@ final class HistoryStore: ObservableObject {
     func refreshAudioDiskUsage() {
         io.async { [weak self] in
             guard let self else { return }
-            let usage = self.totalAudioBytes(self.readRecordsFromDisk())
+            guard let current = self.readRecordsFromDisk() else { return }
+            let usage = self.totalAudioBytes(current)
             DispatchQueue.main.async {
                 self.audioDiskUsageBytes = usage
             }
@@ -424,8 +434,7 @@ final class HistoryStore: ObservableObject {
     }
 
     private func audioFileSize(for record: HistoryRecord) -> Int64 {
-        guard let filename = record.audioFilename, !filename.isEmpty else { return 0 }
-        let url = audioDirectory.appendingPathComponent(filename, isDirectory: false)
+        guard let url = audioURL(for: record) else { return 0 }
         guard let attributes = try? fileManager.attributesOfItem(atPath: url.path),
               let size = attributes[.size] as? Int64 else { return 0 }
         return size
@@ -447,8 +456,8 @@ final class HistoryStore: ObservableObject {
     }
 
     private func deleteAudioFile(for record: HistoryRecord) {
-        guard let filename = record.audioFilename, !filename.isEmpty else { return }
-        let url = audioDirectory.appendingPathComponent(filename, isDirectory: false)
+        guard let url = audioURL(for: record) else { return }
+        let filename = url.lastPathComponent
         guard fileManager.fileExists(atPath: url.path) else { return }
         do {
             try fileManager.removeItem(at: url)

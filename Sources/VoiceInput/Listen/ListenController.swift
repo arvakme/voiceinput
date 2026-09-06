@@ -50,13 +50,11 @@ final class ListenController {
     private var carriedTranslation = ""
 
     /// Auto-reconnect bookkeeping for recoverable session errors. Reset to 0
-    /// on every successful connect or user-driven restart; exhausted after
-    /// `maxReconnectAttempts` consecutive failures, at which point the error
+    /// after a stable connection or user-driven restart; exhausted after
+    /// three consecutive failures, at which point the error
     /// becomes terminal (see `enterTerminalError`).
-    private var reconnectAttempt = 0
+    private var reconnectPolicy = CaptionReconnectPolicy()
     private var reconnectWorkItem: DispatchWorkItem?
-    private let maxReconnectAttempts = 3
-    private let reconnectDelays: [TimeInterval] = [1, 2, 4]
 
     /// Throttles `ListenAudioLevel.level` publishes to ≤20 Hz (see fix for
     /// the redraw storm at capture-callback rate, ~100 Hz for system audio).
@@ -148,28 +146,32 @@ final class ListenController {
         let newSession = LiveCaptionFactory.make(settings: settings)
         session = newSession
 
-        newSession.onConnected = { [weak self] in
-            guard let self else { return }
+        newSession.onConnected = { [weak self, weak newSession] in
+            guard let self, let newSession, self.state.active,
+                  self.session === newSession else { return }
             self.state.connecting = false
             self.state.reconnecting = false
-            self.reconnectAttempt = 0
+            self.reconnectPolicy.connected(at: ProcessInfo.processInfo.systemUptime)
         }
-        newSession.onOriginal = { [weak self] snapshot in
-            guard let self, self.state.active else { return }
+        newSession.onOriginal = { [weak self, weak newSession] snapshot in
+            guard let self, let newSession, self.state.active,
+                  self.session === newSession else { return }
             self.state.original = TranscriptSnapshot(
                 finalText: self.carriedOriginal + snapshot.finalText,
                 interimText: snapshot.interimText
             )
         }
-        newSession.onTranslation = { [weak self] snapshot in
-            guard let self, self.state.active else { return }
+        newSession.onTranslation = { [weak self, weak newSession] snapshot in
+            guard let self, let newSession, self.state.active,
+                  self.session === newSession else { return }
             self.state.translation = TranscriptSnapshot(
                 finalText: self.carriedTranslation + snapshot.finalText,
                 interimText: snapshot.interimText
             )
         }
-        newSession.onError = { [weak self] error in
-            guard let self, self.state.active else { return }
+        newSession.onError = { [weak self, weak newSession] error in
+            guard let self, let newSession, self.state.active,
+                  self.session === newSession else { return }
             switch error {
             case .terminal(let message):
                 self.enterTerminalError(message)
@@ -199,14 +201,13 @@ final class ListenController {
 
     /// A recoverable error (network blip, Soniox's 300-minute session cap):
     /// retry with exponential backoff, carrying the transcript so far. After
-    /// `maxReconnectAttempts` consecutive failures, give up and go terminal —
+    /// three consecutive short-lived failures, give up and go terminal —
     /// endless silent retries would just burn CPU against a dead network.
     private func scheduleReconnect(afterError message: String) {
         guard state.active else { return }
         session?.stop()
         session = nil
-        reconnectAttempt += 1
-        guard reconnectAttempt <= maxReconnectAttempts else {
+        guard let delay = reconnectPolicy.nextDelay(at: ProcessInfo.processInfo.systemUptime) else {
             enterTerminalError(message)
             return
         }
@@ -214,10 +215,9 @@ final class ListenController {
         state.connecting = true
         state.errorMessage = nil
 
-        let attempt = reconnectAttempt
-        let delay = reconnectDelays[attempt - 1]
+        let attempt = reconnectPolicy.attempt
         let workItem = DispatchWorkItem { [weak self] in
-            guard let self, self.state.active, self.reconnectAttempt == attempt else { return }
+            guard let self, self.state.active, self.reconnectPolicy.attempt == attempt else { return }
             self.restartSessionCarryingText(resetReconnect: false)
         }
         reconnectWorkItem?.cancel()
@@ -242,7 +242,7 @@ final class ListenController {
     private func cancelPendingReconnect() {
         reconnectWorkItem?.cancel()
         reconnectWorkItem = nil
-        reconnectAttempt = 0
+        reconnectPolicy.reset()
         state.reconnecting = false
     }
 

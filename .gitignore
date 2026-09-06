@@ -7,3 +7,6 @@ dist/
 Secrets.local.*
 logs/
 VoiceInput-*.dmg
+
+# Machine-local signing identity (never commit personal certificate pins).
+.signing.local.mk

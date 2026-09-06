@@ -10,9 +10,16 @@ let package = Package(
         .executableTarget(
             name: "VoiceInput",
             path: "Sources/VoiceInput",
+            resources: [.copy("Resources/cursor-polish.mjs"), .copy("Resources/provider-models.mjs")],
             swiftSettings: [
                 .swiftLanguageMode(.v5)
             ]
+        ),
+        .testTarget(
+            name: "VoiceInputTests",
+            dependencies: ["VoiceInput"],
+            path: "Tests/VoiceInputTests",
+            swiftSettings: [.swiftLanguageMode(.v5)]
         )
     ]
 )

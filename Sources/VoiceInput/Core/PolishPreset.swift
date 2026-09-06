@@ -32,16 +32,20 @@ struct PolishPreset: Codable, Identifiable, Equatable {
 final class PolishPresetStore: ObservableObject {
     static let shared = PolishPresetStore()
 
+    private let defaults: UserDefaults
+
     @Published var presets: [PolishPreset] {
         didSet { savePresets() }
     }
 
     @Published var selectedPresetID: UUID {
-        didSet { UserDefaults.standard.set(selectedPresetID.uuidString, forKey: Key.selectedID) }
+        didSet { defaults.set(selectedPresetID.uuidString, forKey: Key.selectedID) }
     }
 
     var selected: PolishPreset {
-        presets.first(where: { $0.id == selectedPresetID }) ?? presets[0]
+        presets.first(where: { $0.id == selectedPresetID })
+            ?? presets.first(where: { $0.id == Self.dailyID })
+            ?? Self.defaultPresets[0]
     }
 
     private enum Key {
@@ -52,18 +56,29 @@ final class PolishPresetStore: ObservableObject {
     static let dailyID = UUID(uuidString: "D41A1000-0000-4000-8000-000000000001")!
     static let codingID = UUID(uuidString: "C0D14000-0000-4000-8000-000000000002")!
 
-    private init() {
-        let loaded = Self.loadPresets()
-        let resolvedPresets = loaded.isEmpty ? Self.defaultPresets : loaded
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+        let loaded = Self.loadPresets(from: defaults)
+        var resolvedPresets = loaded.isEmpty ? Self.defaultPresets : loaded
+        // Older or externally edited settings may contain only custom presets.
+        // Keep the non-removable Daily fallback available before exposing the list.
+        if !resolvedPresets.contains(where: { $0.id == Self.dailyID }) {
+            resolvedPresets.insert(Self.defaultPresets[0], at: 0)
+        }
+        // Migrate only the exact old built-in prompt; keep user edits and IDs.
+        if let index = resolvedPresets.firstIndex(where: { $0.id == Self.dailyID && $0.systemPrompt == Self.legacyDailyPrompt }) {
+            resolvedPresets[index].systemPrompt = Self.dailyPrompt
+        }
         presets = resolvedPresets
 
-        if let raw = UserDefaults.standard.string(forKey: Key.selectedID),
+        if let raw = defaults.string(forKey: Key.selectedID),
            let uuid = UUID(uuidString: raw),
            resolvedPresets.contains(where: { $0.id == uuid }) {
             selectedPresetID = uuid
         } else {
             selectedPresetID = Self.dailyID
         }
+        savePresets()
     }
 
     // MARK: Mutations
@@ -85,8 +100,8 @@ final class PolishPresetStore: ObservableObject {
 
     // MARK: Persistence
 
-    private static func loadPresets() -> [PolishPreset] {
-        guard let json = UserDefaults.standard.string(forKey: Key.presets),
+    private static func loadPresets(from defaults: UserDefaults) -> [PolishPreset] {
+        guard let json = defaults.string(forKey: Key.presets),
               let data = json.data(using: .utf8),
               let decoded = try? JSONDecoder().decode([PolishPreset].self, from: data)
         else { return [] }
@@ -97,7 +112,7 @@ final class PolishPresetStore: ObservableObject {
         guard let data = try? JSONEncoder().encode(presets),
               let json = String(data: data, encoding: .utf8)
         else { return }
-        UserDefaults.standard.set(json, forKey: Key.presets)
+        defaults.set(json, forKey: Key.presets)
     }
 
     // MARK: Defaults
@@ -112,9 +127,29 @@ final class PolishPresetStore: ObservableObject {
         ]
     }
 
-    /// Verbatim the prompt VoiceInput has always used — selecting Daily
-    /// changes nothing about existing behavior.
     static let dailyPrompt = """
+        Clean up this dictation for everyday writing. Preserve every substantive point,
+        question, request, negation, number, name, and the speaker's degree of certainty.
+        Remove non-meaningful fillers (嗯、呃、那个、就是说、um、uh), accidental repetitions,
+        abandoned false starts, and fix punctuation and obvious grammar. Keep meaningful
+        emphasis and hedging. Use readable sentences without adding an introduction.
+        Keep the original language and natural Chinese-English mix. Do not translate.
+        Preserve technical identifiers, commands, paths and URLs exactly.
+        Correct ASR spellings only when unambiguous or supported by confirmed vocabulary.
+        Do not guess new facts or replace plausible Chinese words with guessed tech terms.
+        A question stays a question. A request stays a request: never answer or execute it.
+
+        Input: 嗯明天我们我们先测试 VoiceInput 然后再发布可以吗
+        Output: 明天我们先测试 VoiceInput，然后再发布，可以吗？
+        Input: 呃我觉得可能还需要备份一下不是重写是重启这个服务
+        Output: 我觉得可能还需要备份一下。不是重写，是重启这个服务。
+        Input: Um can you can you check the API before we ship
+        Output: Can you check the API before we ship?
+
+        Return only the cleaned dictation. No reply, explanation, preface or quotation wrapper.
+        """
+
+    static let legacyDailyPrompt = """
         You are a text polish pass for a voice-dictation tool.
 
         TASK:

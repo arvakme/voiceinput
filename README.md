@@ -19,7 +19,7 @@ VoiceInput is a voice-input companion for macOS developers and writers. Activate
 - **Compact capsule mode** — minimize the box (⤡ button, top-right) into a small glass capsule with its own resizable dimensions
 - **Dictation history** — every completed session stores raw + refined transcripts and the audio (WAV); browse, search, replay, copy, and delete in the History window (⌘Y from the menu bar)
 - **Live menu-bar state** — template mic when idle, red filled mic while listening, yellow while finalizing, accent waveform while polishing
-- **Media control** — pauses Spotify/Apple Music precisely via AppleScript; other players (browsers, music apps) via CoreAudio playback detection + the system play/pause media key
+- **Media control** — pauses and resumes Spotify/Apple Music via state-checked AppleScript; other players are not automatically controlled
 - **Theme override** — System / Light / Dark picker; all colors resolve dynamically at runtime
 - **Accessibility** — requires Microphone + Accessibility permissions; respects Reduce Transparency
 
@@ -49,6 +49,31 @@ The Makefile assembles a proper `.app` bundle (VoiceInput.app) with:
 - Info.plist with `NSMicrophoneUsageDescription`, `NSAppleEventsUsageDescription` (for media pause)
 - AppIcon.icns in `Contents/Resources`
 - Ad-hoc code signature
+
+## Regression tests and toolchain notes
+
+```bash
+make test           # Swift Testing; no API keys, microphone, or real history required
+```
+
+The offline suite covers corrupt history preservation, audio path boundaries,
+preset fallback, reconnect budgets, and malformed/empty/incomplete LLM responses.
+It does not simulate Accessibility injection, real microphone/system capture,
+or provider authentication. Those still require a manual dictation smoke test.
+
+If macOS 27 beta Command Line Tools fail with `SwiftUIMacros.StateMacro` missing,
+use an installed macOS 26 SDK for this macOS 26+ project, or a complete matching
+Xcode installation. On the audited machine, these commands work around the CLT
+SDK and test-framework lookup issues without changing `xcode-select` globally:
+
+```bash
+make build SWIFT_FLAGS='--sdk /Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk'
+make test SWIFT_FLAGS='--sdk /Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk -Xswiftc -plugin-path -Xswiftc /Library/Developer/CommandLineTools/usr/lib/swift/host/plugins/testing -Xlinker -rpath -Xlinker /Library/Developer/CommandLineTools/Library/Developer/Frameworks -Xlinker -rpath -Xlinker /Library/Developer/CommandLineTools/Library/Developer/usr/lib'
+```
+
+The paths are machine-specific; use your installed SDK/framework paths. This CLT
+version also emits linker warnings for two nonexistent `CommandLineTools/Developer`
+search paths. These are toolchain warnings, not source compilation failures.
 
 ## First Run
 
@@ -233,7 +258,7 @@ One Swift Package Module (VoiceInput), no inter-file imports needed:
 
 **Media doesn't pause while dictating:**
 - First use needs an Automation consent prompt (VoiceInput → Spotify/Music) — approve it in System Settings → Privacy & Security → Automation if missed
-- Non-Spotify/Music players are paused via the system play/pause media key, gated on CoreAudio detecting active output — works for most apps that register with Now Playing
+- Automatic pause/resume supports Spotify and Apple Music only. There is no generic media-key fallback, because it can start playback or launch Music when nothing was playing.
 - The General tab toggle must be on
 
 **Vocabulary not helping:**
@@ -251,3 +276,11 @@ Follows the contract in SPEC.md (public interface compliance). All main-thread m
 ## License
 
 No license specified yet.
+
+## 2026-09-06 product fixes
+
+Polish now supports OpenRouter/custom APIs, the official Cursor SDK with a Cursor User API key, and Codex/Grok account sign-in. See [setup, supported media, and validation](docs/reviews/2026-09-06-product-fixes.md). The Cursor SDK helper is packaged as a SwiftPM resource; use `make build` to produce a complete app bundle.
+
+## Cursor latency, model search, and stable updates
+
+Cursor now prewarms an app-owned worker and reuses runtime infrastructure while keeping each dictation independent. Model fields open searchable provider catalogs, including explicit Fast/Standard variants. Release builds use a persistent signing certificate to preserve app identity across updates. See [measurements and behavior](docs/reviews/2026-09-06-performance-and-permissions.md) and [signing setup](docs/SIGNING.md).

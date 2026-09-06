@@ -34,6 +34,8 @@ final class DictationController {
 
     private var session: TranscriptionSession?
     private var sessionGeneration: UInt64 = 0
+    // Hot-swaps keep the dictation generation but retire engine callbacks.
+    private var engineGeneration: UInt64 = 0
     private var isActive: Bool = false
     private var bestTranscript: String = ""
 
@@ -75,6 +77,8 @@ final class DictationController {
     private var reviewTimer: Timer?
     private var reviewHistoryID: UUID?
     private var reviewRawTranscript: String = ""
+    private var sessionPolishedText: String?
+    private var reviewPolishedText: String?
     private var reviewBackend: String = ""
 
     /// "before" mode only: the review hasn't injected (or recorded to
@@ -177,6 +181,18 @@ final class DictationController {
             return
         }
 
+        // Finalization still owns the ASR result, and injection has a queued
+        // delivery. Starting now would invalidate their generation and discard
+        // speech before it can enter the existing pending-refine flush path.
+        guard session == nil else {
+            Log.app.debug("beginSession ignored — ASR finalization still pending")
+            return
+        }
+        if case .injecting = appState.phase {
+            Log.app.debug("beginSession ignored — text delivery still pending")
+            return
+        }
+
         // A post-dictation review may still be showing (it reuses this same
         // overlay/panel). "after" mode already recorded its transcript when
         // that session ended, so there's just UI state to tear down; "before"
@@ -186,6 +202,8 @@ final class DictationController {
         if case .reviewing = appState.phase {
             abandonReview()
         }
+
+        sessionPolishedText = nil
 
         // A refine pipeline from the PREVIOUS session may still be in flight
         // (slow :free polish models take 10-30 s) — its completion would be
@@ -236,7 +254,7 @@ final class DictationController {
 
         // Update state to connecting immediately.
         DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
+            guard let self, self.sessionGeneration == generation, self.isActive else { return }
             self.appState.phase = .connecting
             self.appState.transcript = TranscriptSnapshot()
             self.appState.audioLevel = 0
@@ -258,6 +276,8 @@ final class DictationController {
     /// (merging `carriedText` from earlier engines of this session), and
     /// starts it. Used by `beginSession` and by mid-session hot-swaps.
     private func startEngine(kind: SessionKind, generation: UInt64) {
+        engineGeneration &+= 1
+        let engineGeneration = self.engineGeneration
         let vocabulary = VocabularyStore.shared
         let asrSession = TranscriptionFactory.make(settings: settings, vocabulary: vocabulary)
         session = asrSession
@@ -272,12 +292,15 @@ final class DictationController {
         // Wire callbacks.
         asrSession.audioLevelHandler = { [weak self] level in
             // Already on main (per contract).
-            self?.appState.audioLevel = level
+            guard let self, self.sessionGeneration == generation,
+                  self.engineGeneration == engineGeneration else { return }
+            self.appState.audioLevel = level
         }
 
         asrSession.onTranscript = { [weak self] snapshot in
             guard let self else { return }
-            guard self.sessionGeneration == generation else { return }
+            guard self.sessionGeneration == generation,
+                  self.engineGeneration == engineGeneration else { return }
             // Already on main (per contract).
             let wasEmpty = self.appState.transcript.isEmpty
             self.engineSnapshot = snapshot
@@ -304,7 +327,8 @@ final class DictationController {
 
         asrSession.onUtteranceEnd = { [weak self] in
             guard let self else { return }
-            guard self.sessionGeneration == generation else { return }
+            guard self.sessionGeneration == generation,
+                  self.engineGeneration == engineGeneration else { return }
             // Already on main (per contract).
             if kind == .handsFree && isStreaming {
                 self.utteranceEndFired = true
@@ -315,14 +339,16 @@ final class DictationController {
 
         asrSession.onError = { [weak self] errorMessage in
             guard let self else { return }
-            guard self.sessionGeneration == generation else { return }
+            guard self.sessionGeneration == generation,
+                  self.engineGeneration == engineGeneration else { return }
             // Already on main (per contract).
             Log.asr.error("ASR error: \(errorMessage)")
             self.appState.phase = .error(errorMessage)
             // After 2 s dismiss and recover.
             DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
                 guard let self else { return }
-                guard self.sessionGeneration == generation else { return }
+                guard self.sessionGeneration == generation,
+                      self.engineGeneration == engineGeneration else { return }
                 self.overlayPanel.dismiss()
                 self.mediaController.resumeIfPaused()
                 self.appState.phase = .idle
@@ -337,7 +363,9 @@ final class DictationController {
 
         // Transition to listening.
         DispatchQueue.main.async { [weak self] in
-            self?.appState.phase = .listening
+            guard let self, self.sessionGeneration == generation,
+                  self.engineGeneration == engineGeneration, self.isActive else { return }
+            self.appState.phase = .listening
         }
 
         do {
@@ -345,11 +373,13 @@ final class DictationController {
         } catch {
             Log.asr.error("ASR start error: \(error)")
             DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
+                guard let self, self.sessionGeneration == generation,
+                      self.engineGeneration == engineGeneration else { return }
                 self.appState.phase = .error(error.localizedDescription)
                 DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
                     guard let self else { return }
-                    guard self.sessionGeneration == generation else { return }
+                    guard self.sessionGeneration == generation,
+                      self.engineGeneration == engineGeneration else { return }
                     self.overlayPanel.dismiss()
                     self.mediaController.resumeIfPaused()
                     self.appState.phase = .idle
@@ -369,7 +399,7 @@ final class DictationController {
             Log.app.debug("endSession ignored — no active session")
             return
         }
-        // Mark inactive immediately so any re-entrant endSession()/cancelSession()
+        // Mark inactive immediately so any re-entrant endSession()
         // (e.g. overlay Stop racing the hands-free silence auto-stop) hits the
         // guard above and returns, rather than calling asrSession.stop() twice.
         isActive = false
@@ -378,8 +408,9 @@ final class DictationController {
         let generation = sessionGeneration
 
         DispatchQueue.main.async { [weak self] in
-            self?.appState.phase = .finalizing
-            self?.appState.silenceCountdown = nil
+            guard let self, self.sessionGeneration == generation, self.session != nil else { return }
+            self.appState.phase = .finalizing
+            self.appState.silenceCountdown = nil
         }
 
         guard let asrSession = session else {
@@ -415,6 +446,9 @@ final class DictationController {
         guard let kind = appState.sessionKind else { return }
 
         Log.app.info("hotSwapEngine → \(self.settings.voiceProvider.rawValue)/\(self.settings.asrBackend.rawValue)")
+
+        // Retire callbacks before stop/cancel, which may call back synchronously.
+        engineGeneration &+= 1
 
         // Freeze the current engine's contribution.
         carriedText = Self.joinTranscripts(carriedText, engineSnapshot.combined)
@@ -466,8 +500,14 @@ final class DictationController {
         return left + separator + right
     }
 
-    /// Cancel: discard transcript, do not inject.
-    /// Idempotent.
+    /// Whether the user still has an undelivered dictation to cancel.
+    private var hasPendingDelivery: Bool {
+        if isActive || session != nil || pendingBestTranscript != nil { return true }
+        if case .injecting = appState.phase { return true }
+        return false
+    }
+
+    /// Cancel: discard transcript, do not inject. Idempotent.
     func cancelSession() {
         // A review has no live session to cancel — "after" mode already
         // injected, so this is just UI teardown; "before" mode resolves as
@@ -478,7 +518,7 @@ final class DictationController {
             abandonReview()
             return
         }
-        guard isActive else {
+        guard hasPendingDelivery else {
             Log.app.debug("cancelSession ignored — no active session")
             return
         }
@@ -499,13 +539,10 @@ final class DictationController {
         overlayPanel.dismiss()
         mediaController.resumeIfPaused()
 
-        DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            self.appState.phase = .idle
-            self.appState.transcript = TranscriptSnapshot()
-            self.appState.silenceCountdown = nil
-            self.appState.sessionKind = nil
-        }
+        appState.phase = .idle
+        appState.transcript = TranscriptSnapshot()
+        appState.silenceCountdown = nil
+        appState.sessionKind = nil
         onSessionCancelled?()
     }
 
@@ -611,6 +648,7 @@ final class DictationController {
 
     /// Called on main thread after ASR finalization.
     private func finishAfterTranscript(text: String, generation: UInt64, externallyEnded: Bool) {
+        engineGeneration &+= 1
         // Materialise the captured audio for history BEFORE clearing `session`.
         // Only copy the WAV when history + keep-audio are both enabled so the
         // bytes are never assembled for users who don't keep audio.
@@ -620,7 +658,7 @@ final class DictationController {
             pendingAudioWAV = nil
         }
 
-        // Mark session as no longer active so endSession/cancelSession are no-ops.
+        // Capture has ended; explicit cancellation remains available during delivery.
         isActive = false
         session = nil
 
@@ -651,6 +689,7 @@ final class DictationController {
             guard let self else { return }
             guard self.sessionGeneration == generation else { return }
             self.pendingBestTranscript = nil
+            self.sessionPolishedText = self.refiner.lastPolishedText
             // refiner completion is on main thread.
             let refinedTrimmed = refined.trimmingCharacters(in: .whitespacesAndNewlines)
             let finalText = refinedTrimmed.isEmpty ? trimmed : refined
@@ -693,12 +732,16 @@ final class DictationController {
         let audioWAV = pendingAudioWAV
         pendingAudioWAV = nil
 
+        let polishedForLearning = sessionPolishedText
         // Brief injecting state for visual feedback, then inject.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
             guard let self else { return }
             guard self.sessionGeneration == generation else { return }
 
             self.textInjector.inject(text)
+            if let polished = polishedForLearning {
+                VocabularyStore.shared.observeCorrections(original: raw, corrected: polished, source: .polish)
+            }
 
             // Record the completed session to history (after the inject step).
             // The store gates itself on historyEnabled / historyKeepAudio.
@@ -803,6 +846,7 @@ final class DictationController {
         activeReviewMode = .before
         reviewRawTranscript = raw
         reviewRefinedTranscript = refined
+        reviewPolishedText = sessionPolishedText
         reviewBackend = backend
         reviewDurationSeconds = duration
         reviewAudioWAV = audioWAV
@@ -947,8 +991,7 @@ final class DictationController {
     /// single mishearing correction rather than a larger rewrite — see
     /// `CorrectionLearner`. Shared by both review modes' correction paths.
     private func learnFromCorrectionIfSmall(original: String, corrected: String) {
-        guard let candidate = CorrectionLearner.detectSubstitution(original: original, corrected: corrected) else { return }
-        VocabularyStore.shared.learnFromCorrection(oldTerm: candidate.oldTerm, newTerm: candidate.newTerm)
+        VocabularyStore.shared.observeCorrections(original: original, corrected: corrected, source: .userCorrection)
     }
 
     /// Applies the user's action from the review editor — semantics differ by
@@ -1019,6 +1062,7 @@ final class DictationController {
         // Snapshot everything BEFORE dismissReview() clears the review state.
         let raw = reviewRawTranscript
         let refined = reviewRefinedTranscript
+        let polishedForLearning = reviewPolishedText
         let duration = reviewDurationSeconds
         let backend = reviewBackend
         let audioWAV = reviewAudioWAV
@@ -1036,6 +1080,9 @@ final class DictationController {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
             guard let self else { return }
             self.textInjector.inject(corrected)
+            if corrected == original, let polished = polishedForLearning {
+                VocabularyStore.shared.observeCorrections(original: raw, corrected: polished, source: .polish)
+            }
 
             let recordID = HistoryStore.shared.record(
                 raw: raw,

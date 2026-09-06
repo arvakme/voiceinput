@@ -1,5 +1,23 @@
 import Cocoa
 
+/// Main-thread capture lease shared by dictation and caption hotkeys.
+/// Keep taps installed but pass events through while Settings owns the keyboard.
+enum ShortcutCaptureCoordinator {
+    static let didBegin = Notification.Name("VoiceInput.shortcutCaptureDidBegin")
+    private static var owners: Set<ObjectIdentifier> = []
+    static var isRecording: Bool { !owners.isEmpty }
+
+    static func begin(_ owner: AnyObject) {
+        let wasRecording = isRecording
+        owners.insert(ObjectIdentifier(owner))
+        if !wasRecording { NotificationCenter.default.post(name: didBegin, object: nil) }
+    }
+
+    static func end(_ owner: AnyObject) {
+        owners.remove(ObjectIdentifier(owner))
+    }
+}
+
 // MARK: - HotkeyKey
 
 enum HotkeyKey: String, CaseIterable, Identifiable {
@@ -189,6 +207,19 @@ final class KeyMonitor {
         case handsFreeRecording
     }
 
+    private var captureObserver: NSObjectProtocol?
+
+    init() {
+        captureObserver = NotificationCenter.default.addObserver(
+            forName: ShortcutCaptureCoordinator.didBegin, object: nil, queue: .main
+        ) { [weak self] _ in self?.reset() }
+    }
+
+    deinit {
+        if let captureObserver { NotificationCenter.default.removeObserver(captureObserver) }
+        stop()
+    }
+
     // MARK: - Configuration
 
     /// Apply new hotkey settings. Takes effect on the next `start()` call (the
@@ -305,6 +336,8 @@ final class KeyMonitor {
             return Unmanaged.passRetained(event)
         }
 
+        guard !ShortcutCaptureCoordinator.isRecording else { return Unmanaged.passRetained(event) }
+
         if key == .customShortcut {
             return handleCustomCGEvent(type: type, event: event)
         }
@@ -387,7 +420,8 @@ final class KeyMonitor {
     }
 
     @discardableResult
-    private func handleNSEvent(_ event: NSEvent) -> Bool {
+    func handleNSEvent(_ event: NSEvent) -> Bool {
+        guard !ShortcutCaptureCoordinator.isRecording else { return false }
         if key == .customShortcut {
             return handleCustomNSEvent(event)
         }
@@ -449,6 +483,7 @@ final class KeyMonitor {
     // MARK: - State machine
 
     private func onKeyDownEdge() {
+        guard !ShortcutCaptureCoordinator.isRecording else { return }
         switch state {
         case .idle:
             pressedAt = Date()
@@ -486,6 +521,7 @@ final class KeyMonitor {
     }
 
     private func onKeyUpEdge() {
+        guard !ShortcutCaptureCoordinator.isRecording else { return }
         switch state {
         case .holdOrTapPending:
             // Released before tap/hold threshold → it's a TAP. Wait for a
@@ -540,7 +576,7 @@ final class KeyMonitor {
     private func scheduleTapHoldTimer() {
         cancelTapHoldTimer()
         let work = DispatchWorkItem { [weak self] in
-            guard let self else { return }
+            guard let self, !ShortcutCaptureCoordinator.isRecording else { return }
             switch self.state {
             case .holdOrTapPending, .holdOrTapPendingSecond:
                 // Held past the threshold → hold session.
@@ -562,7 +598,7 @@ final class KeyMonitor {
     private func scheduleDoubleTapTimer() {
         cancelDoubleTapTimer()
         let work = DispatchWorkItem { [weak self] in
-            guard let self else { return }
+            guard let self, !ShortcutCaptureCoordinator.isRecording else { return }
             // Window elapsed without a second tap — commit to TOGGLE.
             if case .waitingSecondTap = self.state {
                 self.state = .toggleRecording
@@ -581,7 +617,7 @@ final class KeyMonitor {
     private func scheduleForgiveTimer() {
         cancelForgiveTimer()
         let work = DispatchWorkItem { [weak self] in
-            guard let self else { return }
+            guard let self, !ShortcutCaptureCoordinator.isRecording else { return }
             if case .holdReleasePending = self.state {
                 self.state = .idle
                 self.onStop?()

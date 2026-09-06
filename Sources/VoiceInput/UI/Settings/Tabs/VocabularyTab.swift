@@ -26,7 +26,53 @@ struct VocabularyTab: View {
                 )
             }
 
+            learningCard
+
             rimeImportCard
+        }
+    }
+
+    private var learningCard: some View {
+        Card(padding: 18) {
+            CardHeading(
+                title: "Automatic term learning",
+                subtitle: "Your spelling corrections teach full English names and identifiers automatically. AI polish suggestions and Chinese phrases need confirmation before they influence recognition."
+            )
+            InlineRow(title: "Learn from accepted dictation", help: "Works after you insert or apply a review. Turn off to stop collecting new terms and suggestions.") {
+                BlueToggle(isOn: $vocabulary.learningEnabled)
+            }
+            Text("\(vocabulary.entries.filter { $0.autoLearned }.count) learned terms · \(vocabulary.pendingCandidates.count) awaiting confirmation")
+                .font(.system(size: 12))
+                .foregroundStyle(Theme.textSecondary)
+            if vocabulary.pendingCandidates.isEmpty {
+                Text("Correct a name in the review box, or accept a polished transcript. Term suggestions will appear here; ordinary sentence rewrites are ignored.")
+                    .font(.system(size: 12))
+                    .foregroundStyle(Theme.textSecondary)
+            } else {
+                ForEach(vocabulary.pendingCandidates) { suggestion in
+                    Hairline()
+                    HStack(alignment: .center, spacing: 10) {
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text("\(suggestion.oldTerm) → \(suggestion.newTerm)")
+                                .font(.system(size: 13))
+                                .foregroundStyle(Theme.textPrimary)
+                                .textSelection(.enabled)
+                            Text("\(suggestion.source == .polish ? "AI polish" : "Your correction") · seen \(suggestion.observations) time(s)")
+                                .font(.system(size: 11))
+                                .foregroundStyle(Theme.textSecondary)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        Button("Ignore") { vocabulary.dismissSuggestion(suggestion.id) }
+                            .buttonStyle(.bordered)
+                        Button("Learn") { vocabulary.acceptSuggestion(suggestion.id) }
+                            .buttonStyle(.bordered)
+                            .tint(Theme.accent)
+                    }
+                }
+            }
+            Text("Learned terms stay editable in the table. Deleted or ignored terms will not be suggested again; add one manually to allow learning it again.")
+                .font(.system(size: 11))
+                .foregroundStyle(Theme.textSecondary)
         }
     }
 
@@ -153,7 +199,7 @@ struct VocabularyTab: View {
                 Image(systemName: "wand.and.stars")
                     .font(.system(size: 10))
                     .foregroundStyle(Theme.accent)
-                    .help("Learned automatically from a review-box correction")
+                    .help("Learned from your correction or an explicitly approved suggestion")
             }
             cellField(
                 placeholder: "Claude Code",

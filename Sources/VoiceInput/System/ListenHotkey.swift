@@ -42,7 +42,8 @@ final class ListenHotkey {
                 return Unmanaged.passUnretained(event)
             }
 
-            guard type == .keyDown,
+            guard !ShortcutCaptureCoordinator.isRecording,
+                  type == .keyDown,
                   event.getIntegerValueField(.keyboardEventKeycode) == ListenHotkey.spaceKeyCode,
                   event.flags.contains(.maskSecondaryFn),
                   // Fn(+Shift)+Space only — don't hijack ⌘/⌥/⌃ combos.
@@ -52,9 +53,15 @@ final class ListenHotkey {
             else { return Unmanaged.passUnretained(event) }
 
             if event.flags.contains(.maskShift) {
-                DispatchQueue.main.async { monitor.onToggleMode?() }
+                DispatchQueue.main.async {
+                    guard !ShortcutCaptureCoordinator.isRecording else { return }
+                    monitor.onToggleMode?()
+                }
             } else {
-                DispatchQueue.main.async { monitor.onToggle?() }
+                DispatchQueue.main.async {
+                    guard !ShortcutCaptureCoordinator.isRecording else { return }
+                    monitor.onToggle?()
+                }
             }
             return nil   // swallow
         }
@@ -77,7 +84,8 @@ final class ListenHotkey {
         } else {
             // Accessibility not granted (yet): observe-only fallback.
             globalMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
-                guard event.keyCode == UInt16(ListenHotkey.spaceKeyCode),
+                guard !ShortcutCaptureCoordinator.isRecording,
+                      event.keyCode == UInt16(ListenHotkey.spaceKeyCode),
                       event.modifierFlags.contains(.function),
                       event.modifierFlags.intersection([.command, .option, .control]).isEmpty
                 else { return }

@@ -77,6 +77,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         requestPermissionsOnLaunch()
         wireKeyMonitor()
         observeSettings()
+        observeCursorWorker()
         wireURLScheme()
 
         // Live Captions hotkey (Fn+Space toggle, Fn+Shift+Space layout).
@@ -116,6 +117,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        CursorWorker.shared.shutdownAndWait()
+        refiner.cancel()
         if dictationController.isSessionActive {
             dictationController.cancelSession()
         }
@@ -457,6 +460,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             .receive(on: DispatchQueue.main)
             .sink { [weak self] in
                 self?.scheduleHotkeyRewire()
+            }
+            .store(in: &cancellables)
+    }
+
+    /// Prewarm only the selected Cursor connection. Config changes are
+    /// debounced while typing; neither warmup nor shutdown invokes a model.
+    private func observeCursorWorker() {
+        let connections = PolishConnectionStore.shared
+        let runtime = connections.$mode
+            .combineLatest(connections.$apiPreset, connections.$cursorNodePath, connections.$cursorSDKDirectory)
+            .map { _ in () }
+        let credentials = settings.$polishAPIKey.combineLatest(settings.$polishModel, settings.$appEnabled)
+            .map { _ in () }
+        runtime.merge(with: credentials, connections.$cursorModelParams.map { _ in () })
+            .debounce(for: .milliseconds(500), scheduler: DispatchQueue.main)
+            .sink { [weak self] in
+                guard let self else { return }
+                guard self.settings.appEnabled, connections.mode == .api, connections.apiPreset == .cursor,
+                      !self.settings.polishAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                    CursorWorker.shared.shutdown()
+                    return
+                }
+                CursorPolishClient.prewarm(model: self.settings.polishModel, apiKey: self.settings.polishAPIKey,
+                    nodePath: connections.cursorNodePath, sdkDirectory: connections.cursorSDKDirectory,
+                    modelParams: connections.cursorModelParams)
             }
             .store(in: &cancellables)
     }

@@ -47,3 +47,34 @@ enum LiveCaptionFactory {
         }
     }
 }
+
+// MARK: - Reconnect budget
+
+/// A successful WebSocket handshake alone is not a healthy session: the
+/// provider can immediately reject the config or return 429/5xx. Only a
+/// connection that stays up for 30 seconds replenishes the retry budget.
+struct CaptionReconnectPolicy {
+    private(set) var attempt = 0
+    private var connectedAt: TimeInterval?
+    private let delays: [TimeInterval] = [1, 2, 4]
+    private let stableInterval: TimeInterval = 30
+
+    mutating func connected(at uptime: TimeInterval) {
+        connectedAt = uptime
+    }
+
+    mutating func nextDelay(at uptime: TimeInterval) -> TimeInterval? {
+        if let connectedAt, uptime - connectedAt >= stableInterval {
+            attempt = 0
+        }
+        connectedAt = nil
+        attempt += 1
+        guard attempt <= delays.count else { return nil }
+        return delays[attempt - 1]
+    }
+
+    mutating func reset() {
+        attempt = 0
+        connectedAt = nil
+    }
+}

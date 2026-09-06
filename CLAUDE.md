@@ -7,20 +7,21 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Commands
 
 ```bash
-make build     # swift build -c release + assemble VoiceInput.app (ad-hoc codesigned)
+make build     # swift build -c release + assemble VoiceInput.app (stable certificate signature)
 make run       # build and launch
 make install   # build and copy to /Applications
 make clean     # remove build artifacts
+make test      # offline Swift Testing regression suite; no live providers/recording
 swift build -c release   # compile only — must finish with zero errors AND zero warnings
 ```
 
-There is no test suite. Verification is: clean release build, then launch the app and exercise the dictation flow (hotkey → speak → text lands in the focused app).
+Run the Swift Testing suite in `Tests/VoiceInputTests` and a clean release build. The tests use temporary storage and isolated UserDefaults suites, never real recordings or provider credentials. End-to-end verification still requires launching the app and exercising the dictation flow (hotkey → speak → text lands in the focused app). See README's toolchain note when using macOS 27 beta Command Line Tools.
 
 First-run setup: create a gitignored `.env.local` with `SONIOX_API_KEY` and `OPENROUTER_API_KEY`, then `bash scripts/seed-keys.sh` (writes them into the `com.zhijie.VoiceInput` UserDefaults domain). Never hardcode keys in source.
 
 ## What this is
 
-A macOS 26+ menu-bar dictation app (single SPM executable module, no third-party dependencies, Swift language mode v5 — deliberate, to keep ported pre-concurrency AppKit patterns; do not "fix" it to v6). `SPEC.md` is the original build contract: public types/methods are declared there and the code matches it. `docs/research/` holds the protocol/design references the implementation was built against (Soniox WebSocket API, Liquid Glass APIs and technique, ChatWise palette + OpenRouter specifics) — consult these before touching the corresponding subsystem; they are more specific than vendor docs.
+A macOS 26+ menu-bar dictation app (single SPM executable module; optional Cursor Node SDK, Swift language mode v5 — deliberate, to keep ported pre-concurrency AppKit patterns; do not "fix" it to v6). `SPEC.md` is the original build contract: public types/methods are declared there and the code matches it. `docs/research/` holds the protocol/design references the implementation was built against (Soniox WebSocket API, Liquid Glass APIs and technique, ChatWise palette + OpenRouter specifics) — consult these before touching the corresponding subsystem; they are more specific than vendor docs.
 
 ## Big-picture flow
 

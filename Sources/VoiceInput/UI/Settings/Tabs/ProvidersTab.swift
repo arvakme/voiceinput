@@ -12,6 +12,9 @@ struct ProvidersTab: View {
     @EnvironmentObject private var settings: AppSettings
     @EnvironmentObject private var presetStore: PolishPresetStore
 
+    @ObservedObject private var connections = PolishConnectionStore.shared
+    @ObservedObject private var cursorWorker = CursorWorker.shared
+    @State private var testRefiner: Refiner?
     @State private var voiceOutcome: TestOutcome = .idle
     @State private var polishOutcome: TestOutcome = .idle
     @State private var translateOutcome: TestOutcome = .idle
@@ -83,7 +86,8 @@ struct ProvidersTab: View {
                         ModelPickerField(
                             placeholder: SonioxDefaults.realtimeModel,
                             model: $settings.sonioxModel,
-                            kind: .sonioxRealtime
+                            kind: .sonioxRealtime,
+                            apiKey: { settings.sonioxAPIKey }
                         )
                     }
                 } else {
@@ -94,7 +98,8 @@ struct ProvidersTab: View {
                         ModelPickerField(
                             placeholder: "stt-async-v5",
                             model: $settings.sonioxAsyncModel,
-                            kind: .sonioxAsync
+                            kind: .sonioxAsync,
+                            apiKey: { settings.sonioxAPIKey }
                         )
                     }
                 }
@@ -109,7 +114,11 @@ struct ProvidersTab: View {
                     title: "Resource ID",
                     help: "Which purchased resource pack to bill against. ASR 2.0 (Seed-ASR, recommended): volc.seedasr.sauc.duration. ASR 1.0: volc.bigasr.sauc.duration."
                 ) {
-                    FilledTextField(placeholder: "volc.seedasr.sauc.duration", text: $settings.doubaoResourceId, monospaced: true)
+                    VStack(alignment: .leading, spacing: 5) {
+                        FilledTextField(placeholder: "volc.seedasr.sauc.duration", text: $settings.doubaoResourceId, monospaced: true)
+                        Text("Doubao selects the provisioned speech resource, not a model ID. Use the Resource ID from your Volcengine console.")
+                            .font(.caption).foregroundStyle(Theme.textSecondary)
+                    }
                 }
             }
             Hairline()
@@ -133,11 +142,48 @@ struct ProvidersTab: View {
     private var polishPane: some View {
         Card {
             CardHeading(
-                title: "Polish · OpenRouter",
+                title: "Polish",
                 subtitle: "Every dictation runs through the preset below — from Daily's light cleanup to Coding's full rewrite. Add a preset of your own for anything in between."
             )
             presetRow
             Hairline()
+            InlineRow(title: "Connection", help: "Use a subscription account or your own API key.") {
+                Picker("Connection", selection: $connections.mode) {
+                    ForEach(PolishConnection.allCases, id: \.self) { Text($0.label).tag($0) }
+                }.labelsHidden().pickerStyle(.segmented).frame(width: 310)
+            }
+            if connections.mode == .api {
+                InlineRow(title: "API provider", help: "Each provider keeps its own key and model.") {
+                    Picker("API provider", selection: Binding(get: { connections.apiPreset }, set: { connections.selectAPI($0, settings: settings) })) {
+                        ForEach(PolishAPIPreset.allCases, id: \.self) { Text($0.label).tag($0) }
+                    }.labelsHidden().frame(width: 240)
+                }
+                if connections.apiPreset == .cursor { cursorFields } else { compatibleAPIFields }
+            } else {
+                accountFields
+            }
+            if presetStore.selected.modelOverrideEnabled {
+                Text(connections.mode == .api
+                    ? "This preset has its own API endpoint and model. Edit the preset to change or disable that override."
+                    : "The selected account supplies the model; this preset's API override applies only in API mode.")
+                    .font(.caption).foregroundStyle(Theme.textSecondary)
+            }
+            Text(connections.lastRunSummary).font(.caption).foregroundStyle(Theme.textSecondary).textSelection(.enabled)
+            Hairline()
+            TestButton(title: "Test Polish", outcome: polishOutcome) {
+                runPolishTest()
+            }
+        }
+        .sheet(item: $editingPreset) { preset in
+            PresetEditorView(preset: preset)
+        }
+        .sheet(isPresented: $showingNewPresetSheet) {
+            PresetEditorView(preset: nil)
+        }
+    }
+
+    private var compatibleAPIFields: some View {
+        Group {
             FieldRow(
                 title: "Base URL",
                 help: "OpenRouter or any OpenAI-compatible chat-completions endpoint."
@@ -191,16 +237,59 @@ struct ProvidersTab: View {
                     .frame(width: 220)
                 }
             }
-            Hairline()
-            TestButton(title: "Test Polish", outcome: polishOutcome) {
-                runPolishTest()
+        }
+    }
+
+    private var cursorFields: some View {
+        Group {
+            FieldRow(title: "User API key", help: "Create a User API key in Cursor Dashboard → API Keys. SDK usage follows your Cursor plan's request pools.") {
+                SecureFieldRow(placeholder: "Cursor User API key", text: $settings.polishAPIKey)
+            }
+            FieldRow(title: "Model", help: "A model available to your Cursor account.") {
+                ModelPickerField(placeholder: "composer-2.5", model: $settings.polishModel, kind: .cursor,
+                    apiKey: { settings.polishAPIKey }, nodePath: { connections.cursorNodePath },
+                    sdkDirectory: { connections.cursorSDKDirectory }, selectedParameters: $connections.cursorModelParams)
+            }
+            FieldRow(title: "Node executable", help: "Node 22.13 or newer. Leave blank to detect automatically.") {
+                FilledTextField(placeholder: "Automatic", text: $connections.cursorNodePath, monospaced: true)
+            }
+            FieldRow(title: "SDK directory", help: "Folder containing node_modules/@cursor/sdk. Leave blank for VoiceInput's Application Support folder.") {
+                FilledTextField(placeholder: "Default VoiceInput/CursorSDK folder", text: $connections.cursorSDKDirectory, monospaced: true)
+            }
+            Text(cursorWorker.status).font(.caption).foregroundStyle(Theme.textSecondary)
+            Text(cursorWorker.lastTimingSummary).font(.caption).foregroundStyle(Theme.textSecondary)
+            Button(connections.sdkInstalling ? "Installing…" : "Install Cursor SDK") { connections.installCursorSDK() }
+                .disabled(connections.sdkInstalling)
+            if !connections.sdkMessage.isEmpty {
+                Text(connections.sdkMessage).font(.caption).foregroundStyle(Theme.textSecondary)
             }
         }
-        .sheet(item: $editingPreset) { preset in
-            PresetEditorView(preset: preset)
-        }
-        .sheet(isPresented: $showingNewPresetSheet) {
-            PresetEditorView(preset: nil)
+    }
+
+    private var accountFields: some View {
+        Group {
+            HStack {
+                Button(connections.loginInProgress ? "Signing in…" : "Sign in with \(connections.mode == .grok ? "Grok" : "ChatGPT")") { connections.login() }
+                    .disabled(connections.loginInProgress)
+                if connections.loginInProgress { Button("Cancel") { connections.cancelLogin() } }
+            }
+            if !connections.loginMessage.isEmpty {
+                Text(connections.loginMessage).font(.caption).foregroundStyle(Theme.textSecondary)
+            }
+            FieldRow(title: "Model", help: "Leave blank to use the account's default. Model access and limits depend on your subscription.") {
+                ModelPickerField(placeholder: "Account default",
+                    model: connections.mode == .grok ? $connections.grokModel : $connections.codexModel,
+                    kind: connections.mode == .grok ? .grok : .codex,
+                    executablePath: { connections.path(for: connections.mode) },
+                    nodePath: { connections.cursorNodePath })
+            }
+            FieldRow(title: "CLI executable", help: "Uses the official CLI's saved login. Leave blank to detect automatically.") {
+                FilledTextField(placeholder: "Automatic", text: connections.mode == .grok ? $connections.grokPath : $connections.codexPath, monospaced: true)
+            }
+            Text(connections.mode == .grok
+                 ? "Grok Build must be installed. Polish uses a temporary, isolated session."
+                 : "Codex CLI must be installed. Polish runs use ephemeral sessions.")
+                .font(.caption).foregroundStyle(Theme.textSecondary)
         }
     }
 
@@ -368,7 +457,8 @@ struct ProvidersTab: View {
                     title: "Model",
                     help: "Translate model (…-live-translate-…) outputs original + translation. A general live model is cheaper for text-only captions."
                 ) {
-                    FilledTextField(placeholder: "gemini-3.5-live-translate-preview", text: $settings.geminiLiveModel, monospaced: true)
+                    ModelPickerField(placeholder: "gemini-3.5-live-translate-preview", model: $settings.geminiLiveModel,
+                        kind: .geminiLive, apiKey: { settings.geminiAPIKey })
                 }
             }
             Hairline()
@@ -431,7 +521,10 @@ struct ProvidersTab: View {
 
     private func runPolishTest() {
         polishOutcome = .running
-        refiner.testPolish { result in
+        testRefiner?.cancel()
+        let tester = Refiner(settings: settings, vocabulary: .shared, presets: presetStore)
+        testRefiner = tester
+        tester.testPolish { result in
             switch result {
             case .success(let text):
                 polishOutcome = .success(text)
@@ -443,7 +536,10 @@ struct ProvidersTab: View {
 
     private func runTranslateTest() {
         translateOutcome = .running
-        refiner.testTranslate { result in
+        testRefiner?.cancel()
+        let tester = Refiner(settings: settings, vocabulary: .shared, presets: presetStore)
+        testRefiner = tester
+        tester.testTranslate { result in
             switch result {
             case .success(let text):
                 translateOutcome = .success(text)

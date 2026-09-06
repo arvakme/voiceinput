@@ -3,6 +3,8 @@ import SwiftUI
 /// General settings: master enable toggle, language hints, and media auto-pause.
 struct GeneralTab: View {
     @EnvironmentObject private var settings: AppSettings
+    @ObservedObject private var mediaStatus = MediaControlStatus.shared
+    @State private var mediaAccess = MediaController()
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -31,9 +33,27 @@ struct GeneralTab: View {
 
                 InlineRow(
                     title: "Pause media while dictating",
-                    help: "Spotify and Apple Music are paused via AppleScript, and only if they're already playing, so resume never starts something that wasn't running. Other players (browsers, IINA, NetEase, etc.) are not affected."
+                    help: "Pauses playing Spotify, Apple Music, and HTML5 audio/video in Chrome and Safari. Browsers also require Allow JavaScript from Apple Events. Cross-origin embeds, Web Audio, IINA and other players are not supported."
                 ) {
                     BlueToggle(isOn: $settings.mediaAutoPause)
+                }
+
+                if settings.mediaAutoPause {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(mediaStatus.message)
+                            .font(.system(size: 12))
+                            .foregroundStyle(Theme.textSecondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                        HStack(spacing: 12) {
+                            Button("Check media access") { mediaAccess.checkAccess() }
+                            Button("Automation settings") {
+                                if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Automation") {
+                                    NSWorkspace.shared.open(url)
+                                }
+                            }
+                        }
+                        .font(.system(size: 12))
+                    }
                 }
 
                 Hairline()

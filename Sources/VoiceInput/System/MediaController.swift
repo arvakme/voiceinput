@@ -1,297 +1,424 @@
 import AppKit
+import Combine
 import Foundation
 
-// CoreServices / AE framework — used for TCC automation-permission probe.
-// AEDeterminePermissionToAutomateTarget is declared in <AE/AppleEvents.h> which
-// is part of CoreServices and re-exported through ApplicationServices. We
-// import ApplicationServices to pull it in cleanly from Swift.
-import ApplicationServices
+/// Transient diagnostics for Settings; never stores playback titles or URLs.
+final class MediaControlStatus: ObservableObject {
+    static let shared = MediaControlStatus()
+    @Published private(set) var message = "Supports Spotify, Apple Music, and HTML5 audio/video in Chrome and Safari. Automation access is required."
 
-/// Pauses currently-playing media when the user starts dictating and resumes
-/// exactly the thing we paused when they are done.
-///
-/// Strategy (in priority order):
-/// 1. Spotify — AppleScript "tell application "Spotify" to pause/play"
-/// 2. Apple Music — AppleScript "tell application "Music" to pause/play"
-///
-/// There is deliberately NO generic fallback. The previous CoreAudio +
-/// system-Play/Pause-media-key path was removed: the only available signal
-/// (`kAudioDevicePropertyDeviceIsRunningSomewhere`) is true whenever ANY app
-/// merely holds the output device open (browsers, Discord, etc., even while
-/// silent), so it false-positived constantly. When it fired with nothing
-/// actually playing, macOS routed the media key to its default handler and
-/// LAUNCHED Apple Music. Only the two apps we can query precisely (Spotify,
-/// Music) are paused; nothing can be launched.
-///
-/// MRMediaRemote is NOT used — `MRMediaRemoteSendCommand` has been ineffective
-/// for unsigned third-party apps since macOS 15.4.
-///
-/// All AppleScript I/O runs as `/usr/bin/osascript` subprocesses on a private
-/// serial queue — never on the caller's thread. `pauseIfPlaying`/
-/// `resumeIfPaused` enqueue and return immediately (call-and-forget); the
-/// queue being serial guarantees a `resumeIfPaused` enqueued right after
-/// `pauseIfPlaying` runs only once the pause has actually completed and its
-/// state (`didPauseMedia`/`strategy`) is settled.
-///
-/// TCC / automation consent: `.accessory` (no-Dock) apps do not bring
-/// themselves to front when an AppleScript runs, so the TCC consent dialog can
-/// be silently blocked behind other windows. Before a first Spotify/Music
-/// AppleScript call we probe `AEDeterminePermissionToAutomateTarget` with
-/// `askUserIfNeeded: false`; if the status indicates consent has NOT been
-/// granted yet (errAEEventWouldRequireUserConsent) we call
-/// `NSApp.activate(ignoringOtherApps: true)` once so the dialog is visible.
-///
-/// All pause/resume is guarded by `AppSettings.shared.mediaAutoPause` checked
-/// INSIDE these methods so callers stay unconditional.
+    func update(_ message: String) {
+        DispatchQueue.main.async { self.message = message }
+    }
+}
+
+enum MediaScriptResult {
+    case success(String)
+    case failure(String)
+    case timedOut
+}
+
+/// Controls only known, already-running players. Never sends a generic media
+/// key: that can launch Apple Music when nothing is actually playing.
+/// State checks and actions share one AppleScript, addressed by bundle ID.
+/// All subprocess work is serialized and bounded; the main thread only queues
+/// work. Resume is paired with successful pauses, even if the setting changes.
 final class MediaController {
-
-    // MARK: - State (confined to `queue` — see below)
-
-    private var didPauseMedia = false
-
-    private enum Strategy {
-        case spotify
-        case music
+    struct Player {
+        let bundleID: String
+        let name: String
     }
-    private var strategy: Strategy?
+    static let supportedPlayers = [
+        Player(bundleID: "com.spotify.client", name: "Spotify"),
+        Player(bundleID: "com.apple.Music", name: "Apple Music"),
+    ]
 
-    /// Serializes all AppleScript subprocess launches. `waitUntilExit` runs
-    /// here, which is fine — this is never the main thread.
     private let queue = DispatchQueue(label: "com.zhijie.VoiceInput.MediaController")
+    private let enabled: () -> Bool
+    private let isRunning: (String) -> Bool
+    private let runScript: (String) -> MediaScriptResult
+    private let report: (String) -> Void
+    // Confined to queue. A repeated pause must not discard these receipts.
+    private var pausedPlayers: [Player] = []
+    private var browserReceipts: [(browser: BrowserMediaScripts.Browser, token: String)] = []
 
-    // MARK: - Init / deinit
+    init(enabled: @escaping () -> Bool = { AppSettings.shared.mediaAutoPause },
+         isRunning: @escaping (String) -> Bool = { bundleID in
+             NSWorkspace.shared.runningApplications.contains { $0.bundleIdentifier == bundleID }
+         },
+         runScript: @escaping (String) -> MediaScriptResult = MediaController.executeScript,
+         report: @escaping (String) -> Void = { MediaControlStatus.shared.update($0) }) {
+        self.enabled = enabled
+        self.isRunning = isRunning
+        self.runScript = runScript
+        self.report = report
+    }
 
-    init() {}
-
-    // MARK: - Public API
-
-    /// Pauses media if something is playing. Enqueues the work and returns
-    /// immediately; does not block the caller.
-    ///
-    /// Guards `AppSettings.shared.mediaAutoPause` first. Only the strategy that
-    /// actually succeeds sets `didPauseMedia = true`, so `resumeIfPaused()` only
-    /// undoes what we did.
     func pauseIfPlaying() {
+        // Read UI-bound settings on the caller (main) thread, not the worker.
+        let shouldPause = enabled()
         queue.async { [weak self] in
-            self?.pauseIfPlayingOnQueue()
+            guard let self, shouldPause, self.pausedPlayers.isEmpty,
+                  self.browserReceipts.isEmpty else { return }
+            var foundPlayer = false
+            var failures: [String] = []
+            for player in Self.supportedPlayers where self.isRunning(player.bundleID) {
+                foundPlayer = true
+                switch self.runScript(Self.script(for: player, action: .pause)) {
+                case .success("paused"):
+                    self.pausedPlayers.append(player)
+                case .success("idle"), .success("not-running"):
+                    break
+                case .success:
+                    failures.append("\(player.name): unexpected response from player.")
+                case .failure(let detail):
+                    failures.append(Self.failureMessage(player: player, detail: detail))
+                case .timedOut:
+                    failures.append("\(player.name): control timed out. Check Automation access in System Settings.")
+                }
+            }
+            var browserMediaCount = 0
+            for browser in BrowserMediaScripts.Browser.allCases where self.isRunning(browser.bundleID) {
+                foundPlayer = true
+                let token = UUID().uuidString
+                // Even a timed-out script may have paused some tabs. The token
+                // can restore only those elements for which JS stored a receipt.
+                self.browserReceipts.append((browser, token))
+                let script = BrowserMediaScripts.appleScript(browser: browser,
+                    javaScript: BrowserMediaScripts.pauseJavaScript(token: token))
+                switch self.runScript(script) {
+                case .success(let result):
+                    let counts = result.split(separator: ":").compactMap { Int($0) }
+                    if counts.count == 2 {
+                        browserMediaCount += counts[0]
+                        if counts[1] > 0 {
+                            failures.append("\(browser.name): \(counts[1]) tabs unavailable. Enable \(browser.permissionHelp). Restricted pages and embedded cross-origin players may remain unavailable.")
+                        }
+                    } else {
+                        failures.append("\(browser.name): could not confirm media control.")
+                    }
+                case .failure:
+                    failures.append("\(browser.name): check Automation access and \(browser.permissionHelp).")
+                case .timedOut:
+                    failures.append("\(browser.name): media control timed out. Check Automation access and \(browser.permissionHelp).")
+                }
+            }
+            if !failures.isEmpty {
+                self.report(failures.joined(separator: " "))
+            } else if !self.pausedPlayers.isEmpty || browserMediaCount > 0 {
+                let apps = self.pausedPlayers.map(\.name)
+                let summary = apps + (browserMediaCount > 0 ? ["\(browserMediaCount) browser media elements"] : [])
+                self.report("Paused \(summary.joined(separator: " and ")).")
+            } else {
+                self.report(foundPlayer
+                    ? "Automation access succeeded; supported players are not playing."
+                    : "No supported player is running. Open Spotify, Apple Music, Chrome or Safari. IINA and other players are not controlled.")
+            }
         }
     }
 
-    /// Resumes only the source we actually paused. Enqueues the work and
-    /// returns immediately.
-    ///
-    /// Deliberately does NOT re-check `AppSettings.shared.mediaAutoPause`: the
-    /// gate lives in `pauseIfPlaying`, and whatever we actually paused must
-    /// always be resumed even if the user toggles the setting off mid-session.
-    /// Otherwise their media would stay paused forever.
     func resumeIfPaused() {
-        queue.async { [weak self] in
-            self?.resumeIfPausedOnQueue()
-        }
+        queue.async { [weak self] in self?.resumeOnQueue() }
     }
 
-    /// Synchronous variant of `resumeIfPaused()`, blocking the CALLING thread
-    /// until the resume completes or `timeout` elapses. Used ONLY from
-    /// `applicationWillTerminate`: `NSApplicationDelegate` gives termination no
-    /// way to keep the process alive for the normal fire-and-forget async
-    /// path, so quitting mid-dictation could otherwise leave Spotify/Music
-    /// paused forever. Every other call site must keep using `resumeIfPaused()`.
+    /// Used only during application termination, where async work may be cut off.
     func resumeIfPausedAndWait(timeout: TimeInterval) {
-        let semaphore = DispatchSemaphore(value: 0)
+        let finished = DispatchSemaphore(value: 0)
         queue.async { [weak self] in
-            self?.resumeIfPausedOnQueue()
-            semaphore.signal()
+            self?.resumeOnQueue()
+            finished.signal()
         }
-        _ = semaphore.wait(timeout: .now() + timeout)
+        _ = finished.wait(timeout: .now() + timeout)
     }
 
-    // MARK: - Queue-confined implementation
-
-    private func pauseIfPlayingOnQueue() {
-        didPauseMedia = false
-        strategy = nil
-
-        guard AppSettings.shared.mediaAutoPause else {
-            Log.app.info("MediaController: mediaAutoPause disabled — skipping pause")
-            return
-        }
-
-        // --- Spotify (precise) ---
-        if isAppRunning("com.spotify.client") {
-            Log.app.info("MediaController: Spotify is running — checking state")
-            if playerState(app: "Spotify") == "playing" {
-                // Only bring ourselves to front when an AppleScript that needs
-                // consent is actually imminent, so we never steal focus when
-                // nothing is playing.
-                activateIfConsentNeeded(bundleID: "com.spotify.client")
-                if runSimple("tell application \"Spotify\" to pause") {
-                    strategy = .spotify
-                    didPauseMedia = true
-                    Log.app.info("MediaController: paused Spotify via AppleScript")
-                    return
-                } else {
-                    Log.app.warning("MediaController: Spotify AppleScript pause failed (TCC denied?)")
+    /// Explicit Settings action: queries state/permission without pausing,
+    /// resuming, activating, or launching a player. macOS may ask for consent.
+    func checkAccess() {
+        queue.async { [self] in
+            let running = Self.supportedPlayers.filter { self.isRunning($0.bundleID) }
+            let browsers = BrowserMediaScripts.Browser.allCases.filter { self.isRunning($0.bundleID) }
+            guard !running.isEmpty || !browsers.isEmpty else {
+                self.report("Open Spotify, Apple Music, Chrome or Safari first, then check access. IINA and other players are not supported.")
+                return
+            }
+            var messages: [String] = []
+            for player in running {
+                switch self.runScript(Self.script(for: player, action: .check)) {
+                case .success("not-running"):
+                    messages.append("\(player.name) is no longer running.")
+                case .success:
+                    messages.append("\(player.name): Automation access available.")
+                case .failure(let detail):
+                    messages.append(Self.failureMessage(player: player, detail: detail))
+                case .timedOut:
+                    messages.append("\(player.name): timed out. Check for an Automation consent dialog.")
                 }
-            } else {
-                Log.app.info("MediaController: Spotify not playing — no pause needed")
             }
-        } else {
-            Log.app.info("MediaController: Spotify not running")
-        }
-
-        // --- Apple Music (precise) ---
-        if isAppRunning("com.apple.Music") {
-            Log.app.info("MediaController: Music is running — checking state")
-            if playerState(app: "Music") == "playing" {
-                // Only bring ourselves to front when an AppleScript that needs
-                // consent is actually imminent, so we never steal focus when
-                // nothing is playing.
-                activateIfConsentNeeded(bundleID: "com.apple.Music")
-                if runSimple("tell application \"Music\" to pause") {
-                    strategy = .music
-                    didPauseMedia = true
-                    Log.app.info("MediaController: paused Music via AppleScript")
-                    return
-                } else {
-                    Log.app.warning("MediaController: Music AppleScript pause failed (TCC denied?)")
+            for browser in browsers {
+                // Probe JS capability without inspecting or mutating media.
+                let result = self.runScript(BrowserMediaScripts.appleScript(browser: browser, javaScript: "0"))
+                switch result {
+                case .success(let counts) where counts.hasSuffix(":0"):
+                    messages.append("\(browser.name): available on accessible tabs (if any).")
+                default:
+                    messages.append("\(browser.name): check Automation access and \(browser.permissionHelp). Some restricted pages cannot be controlled.")
                 }
-            } else {
-                Log.app.info("MediaController: Music not playing — no pause needed")
             }
-        } else {
-            Log.app.info("MediaController: Apple Music not running")
-        }
-
-        // No generic fallback by design — see the type doc comment.
-        Log.app.info("MediaController: no Spotify/Music playback to pause")
-    }
-
-    private func resumeIfPausedOnQueue() {
-        guard didPauseMedia, let strategy else {
-            Log.app.info("MediaController: resumeIfPaused called but nothing was paused — no-op")
-            return
-        }
-        didPauseMedia = false
-        self.strategy = nil
-
-        switch strategy {
-        case .spotify:
-            _ = runSimple("tell application \"Spotify\" to play")
-            Log.app.info("MediaController: resumed Spotify via AppleScript")
-        case .music:
-            _ = runSimple("tell application \"Music\" to play")
-            Log.app.info("MediaController: resumed Music via AppleScript")
+            self.report(messages.joined(separator: " "))
         }
     }
 
-    // MARK: - TCC consent probe
-
-    /// Probes automation permission for `bundleID` WITHOUT prompting the user.
-    /// If the status indicates consent is not yet granted
-    /// (`errAEEventWouldRequireUserConsent` == -1744) we activate the app once
-    /// so that the TCC dialog (which fires on the next actual AppleScript call)
-    /// is visible in front of other windows.
-    private func activateIfConsentNeeded(bundleID: String) {
-        // Build an AEAddressDesc targeting the app by bundle ID.
-        // typeApplicationBundleID lets us address the app without a pid.
-        guard let cfID = bundleID as CFString?,
-              let data = CFStringCreateExternalRepresentation(
-                  nil, cfID, CFStringBuiltInEncodings.UTF8.rawValue, 0)
-        else { return }
-
-        var target = AEDesc()
-        let cfDataPtr = CFDataGetBytePtr(data)
-        let cfDataLen = CFDataGetLength(data)
-
-        // typeApplicationBundleID = 'bund' = 0x62756E64
-        let typeApplicationBundleID: OSType = 0x62756E64
-        let createErr = AECreateDesc(typeApplicationBundleID, cfDataPtr, cfDataLen, &target)
-        guard createErr == noErr else {
-            Log.app.warning("MediaController: AECreateDesc failed \(createErr) for \(bundleID)")
-            return
-        }
-        defer { AEDisposeDesc(&target) }
-
-        // typeWildCard for both class and ID means "any Apple event".
-        let typeWildCard: OSType = 0x2A2A2A2A // '****'
-        let status = AEDeterminePermissionToAutomateTarget(
-            &target,
-            typeWildCard,
-            typeWildCard,
-            false   // askUserIfNeeded: false — probe only, do NOT prompt here
-        )
-
-        // errAEEventWouldRequireUserConsent == -1744: permission not yet decided.
-        // errAEEventNotPermitted == -1743: user already denied (nothing we can do).
-        // procNotFound == -600: target not running (shouldn't happen — we checked).
-        // noErr == 0: already permitted.
-        switch status {
-        case noErr:
-            Log.app.info("MediaController: automation consent already granted for \(bundleID)")
-        case OSStatus(-1744): // errAEEventWouldRequireUserConsent
-            Log.app.info("MediaController: consent not yet determined for \(bundleID) — activating app so TCC dialog is visible")
-            // NSApp.activate touches AppKit — hop back to main rather than
-            // calling it from this background queue.
-            DispatchQueue.main.async {
-                NSApp.activate(ignoringOtherApps: true)
+    private func resumeOnQueue() {
+        let players = pausedPlayers
+        pausedPlayers.removeAll()
+        var messages: [String] = []
+        for player in players {
+            // The user may have quit the player during dictation. Do not reopen it.
+            guard isRunning(player.bundleID) else {
+                messages.append("\(player.name) was closed; playback was not restarted.")
+                continue
             }
-        case OSStatus(-1743): // errAEEventNotPermitted
-            Log.app.warning("MediaController: automation denied for \(bundleID) — AppleScript will fail")
-        case OSStatus(-600): // procNotFound
-            Log.app.info("MediaController: \(bundleID) not running (procNotFound) — consent probe skipped")
-        default:
-            Log.app.warning("MediaController: AEDeterminePermissionToAutomateTarget returned \(status) for \(bundleID)")
+            switch runScript(Self.script(for: player, action: .resume)) {
+            case .success("resumed"):
+                messages.append("Resumed \(player.name).")
+            case .success:
+                messages.append("\(player.name): playback state changed; no resume needed.")
+            case .failure(let detail):
+                messages.append(Self.failureMessage(player: player, detail: detail))
+            case .timedOut:
+                messages.append("\(player.name): resume timed out. Resume playback manually.")
+            }
         }
+        let receipts = browserReceipts
+        browserReceipts.removeAll()
+        for receipt in receipts where isRunning(receipt.browser.bundleID) {
+            let script = BrowserMediaScripts.appleScript(browser: receipt.browser,
+                javaScript: BrowserMediaScripts.resumeJavaScript(token: receipt.token))
+            switch runScript(script) {
+            case .success(let counts):
+                let values = counts.split(separator: ":").compactMap { Int($0) }
+                if values.count == 2, values[1] == 0 {
+                    messages.append("\(receipt.browser.name): resume requested for \(values[0]) unchanged media elements.")
+                } else {
+                    messages.append("\(receipt.browser.name): some tabs could not resume. Resume playback manually if needed.")
+                }
+            default:
+                messages.append("\(receipt.browser.name): could not restore browser playback. Resume manually if needed.")
+            }
+        }
+        if !messages.isEmpty { report(messages.joined(separator: " ")) }
     }
 
-    // MARK: - AppleScript helpers (queue-confined)
+    private enum Action { case pause, resume, check }
 
-    private func isAppRunning(_ bundleID: String) -> Bool {
-        NSWorkspace.shared.runningApplications.contains { $0.bundleIdentifier == bundleID }
+    private static func script(for player: Player, action: Action) -> String {
+        let operation: String
+        switch action {
+        case .pause:
+            operation = """
+            if player state is playing then
+                pause
+                return "paused"
+            end if
+            return "idle"
+            """
+        case .resume:
+            operation = """
+            if player state is paused then
+                play
+                return "resumed"
+            end if
+            return "unchanged"
+            """
+        case .check:
+            operation = "return player state as string"
+        }
+        // Repeat the running check inside the script to cover a player exiting
+        // after NSWorkspace's snapshot. Never use `activate` or a media key.
+        return """
+        with timeout of 3 seconds
+            if application id "\(player.bundleID)" is running then
+                tell application id "\(player.bundleID)"
+                    \(operation)
+                end tell
+            end if
+            return "not-running"
+        end timeout
+        """
     }
 
-    /// Returns "playing", "paused", "stopped", or nil on script error.
-    private func playerState(app: String) -> String? {
-        let source = "tell application \"\(app)\" to return player state as string"
-        guard let state = runOSAScript(source), !state.isEmpty else { return nil }
-        Log.app.info("MediaController: \(app) player state = \(state)")
-        return state
+    private static func failureMessage(player: Player, detail: String) -> String {
+        if detail.contains("-1743") || detail.contains("-1744") {
+            return "\(player.name): Automation access denied. Enable VoiceInput → \(player.name) in System Settings → Privacy & Security → Automation."
+        }
+        if detail.contains("-1712") {
+            return "\(player.name): control timed out. Check Automation access or retry after the player responds."
+        }
+        // These fixed scripts contain no titles/URLs; cap diagnostic length.
+        return "\(player.name): \(detail.prefix(250))"
     }
 
-    /// Runs a one-liner AppleScript. Returns true on success.
-    @discardableResult
-    private func runSimple(_ source: String) -> Bool {
-        runOSAScript(source) != nil
-    }
-
-    /// Runs `source` via `/usr/bin/osascript -e` and returns trimmed stdout,
-    /// or nil if the process failed to launch or exited non-zero.
-    private func runOSAScript(_ source: String) -> String? {
+    static func executeScript(_ source: String) -> MediaScriptResult {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
         process.arguments = ["-e", source]
+        let stdout = Pipe()
+        let stderr = Pipe()
+        process.standardOutput = stdout
+        process.standardError = stderr
+        let finished = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in finished.signal() }
+        do { try process.run() }
+        catch { return .failure("Unable to run media control: \(error.localizedDescription)") }
 
-        let outPipe = Pipe()
-        process.standardOutput = outPipe
-        process.standardError = Pipe()
-
-        do {
-            try process.run()
-        } catch {
-            Log.app.warning("MediaController: osascript launch failed: \(error.localizedDescription)")
-            return nil
+        // Both pipes must be drained, including stderr (previously discarded).
+        let output = ScriptOutput()
+        let readers = DispatchGroup()
+        for (pipe, isError) in [(stdout, false), (stderr, true)] {
+            readers.enter()
+            DispatchQueue.global(qos: .utility).async {
+                output.store(pipe.fileHandleForReading.readDataToEndOfFile(), isError: isError)
+                readers.leave()
+            }
         }
-
-        // Drain stdout to EOF before waitUntilExit: osascript's output here is
-        // a few bytes, but reading first avoids ever blocking on a full pipe
-        // while the child blocks on write.
-        let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
-
+        let timedOut = finished.wait(timeout: .now() + 4) == .timedOut
+        if timedOut {
+            if process.isRunning { process.terminate() }
+            if finished.wait(timeout: .now() + 0.2) == .timedOut, process.isRunning {
+                kill(process.processIdentifier, SIGKILL)
+                _ = finished.wait(timeout: .now() + 0.2)
+            }
+        }
+        _ = readers.wait(timeout: .now() + 0.2)
+        if timedOut { return .timedOut }
+        let (out, err) = output.snapshot()
         guard process.terminationStatus == 0 else {
-            Log.app.warning("MediaController: osascript exited \(process.terminationStatus)")
-            return nil
+            return .failure(err.isEmpty ? "Media control exited with code \(process.terminationStatus)." : err)
         }
-        return String(data: outData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return .success(out)
+    }
+}
+
+private final class ScriptOutput: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stdout = Data()
+    private var stderr = Data()
+    func store(_ data: Data, isError: Bool) {
+        lock.lock(); defer { lock.unlock() }
+        if isError { stderr = data } else { stdout = data }
+    }
+    func snapshot() -> (String, String) {
+        lock.lock(); defer { lock.unlock() }
+        return (String(decoding: stdout, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines),
+                String(decoding: stderr, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+}
+
+/// Official installed sdefs: Chrome `execute tab javascript`, Safari
+/// `do JavaScript ... in tab`. Scripts return counts only, never page data.
+enum BrowserMediaScripts {
+    enum Browser: CaseIterable {
+        case chrome, safari
+        var bundleID: String { self == .chrome ? "com.google.Chrome" : "com.apple.Safari" }
+        var name: String { self == .chrome ? "Chrome" : "Safari" }
+        var permissionHelp: String {
+            self == .chrome
+                ? "Chrome → View → Developer → Allow JavaScript from Apple Events"
+                : "Safari → Develop → Allow JavaScript from Apple Events"
+        }
+    }
+
+    static func pauseJavaScript(token: String) -> String {
+        // token is always a locally generated UUID, never webpage/user input.
+        """
+        (() => {
+          const key = '__voiceinput_media_\(token)';
+          if (document[key]) return 0;
+          const state = { document, items: [] };
+          document[key] = state;
+          for (const media of document.querySelectorAll('video,audio')) {
+            if (media.paused || media.ended || media.readyState < 2) continue;
+            const item = { media, owner: document, sourceObject: media.srcObject, valid: true };
+            const invalidate = () => { item.valid = false; };
+            const events = ['play', 'seeking', 'emptied', 'loadstart', 'ended'];
+            const observer = new MutationObserver(invalidate);
+            try {
+              media.pause();
+              if (!media.paused) continue;
+              events.forEach(event => media.addEventListener(event, invalidate));
+              observer.observe(media, { attributes: true, attributeFilter: ['src'], childList: true, subtree: true });
+              item.cleanup = () => {
+                events.forEach(event => media.removeEventListener(event, invalidate));
+                observer.disconnect();
+              };
+              item.observer = observer;
+              state.items.push(item);
+            } catch (_) { observer.disconnect(); }
+          }
+          if (!state.items.length) { delete document[key]; return 0; }
+          // Expire receipts without playing anything if the app goes away.
+          state.timer = setTimeout(() => {
+            state.items.forEach(item => item.cleanup());
+            delete document[key];
+          }, 3600000);
+          return state.items.length;
+        })()
+        """
+    }
+
+    static func resumeJavaScript(token: String) -> String {
+        """
+        (() => {
+          const key = '__voiceinput_media_\(token)';
+          const state = document[key];
+          if (!state || state.document !== document) return 0;
+          delete document[key];
+          clearTimeout(state.timer);
+          let count = 0;
+          for (const item of state.items) {
+            const media = item.media;
+            if (item.observer.takeRecords().length) item.valid = false;
+            item.cleanup();
+            if (!item.valid || !media.isConnected || item.owner !== document ||
+                media.ownerDocument !== document || media.srcObject !== item.sourceObject ||
+                !media.paused || media.ended) continue;
+            try {
+              const promise = media.play();
+              if (promise && promise.catch) promise.catch(() => {});
+              count++;
+            } catch (_) {}
+          }
+          return count;
+        })()
+        """
+    }
+
+    static func appleScript(browser: Browser, javaScript: String) -> String {
+        let quoted = "\"" + javaScript.replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"") + "\""
+        let command = browser == .chrome
+            ? "execute currentTab javascript \(quoted)"
+            : "do JavaScript \(quoted) in currentTab"
+        return """
+        with timeout of 3 seconds
+            if application id "\(browser.bundleID)" is not running then return "0:0"
+            tell application id "\(browser.bundleID)"
+                set controlledCount to 0
+                set unavailableCount to 0
+                repeat with currentWindow in windows
+                    repeat with currentTab in tabs of currentWindow
+                        try
+                            set mediaCount to (\(command))
+                            set controlledCount to controlledCount + (mediaCount as integer)
+                        on error errorMessage number errorNumber
+                            if errorNumber is -1743 then error "Automation access denied" number -1743
+                            set unavailableCount to unavailableCount + 1
+                        end try
+                    end repeat
+                end repeat
+                return (controlledCount as text) & ":" & (unavailableCount as text)
+            end tell
+        end timeout
+        """
     }
 }

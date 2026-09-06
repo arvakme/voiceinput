@@ -265,7 +265,7 @@ final class SonioxRealtimeSession: TranscriptionSession {
     private func receiveLoop(task: URLSessionWebSocketTask, gen: UInt64) {
         task.receive { [weak self] result in
             guard let self else { return }
-            self.wsQueue.async {
+            self.wsQueue.async { [self] in
                 guard self.isCurrentGen(gen), self.wsTask === task else { return }
                 switch result {
                 case .success(let message):

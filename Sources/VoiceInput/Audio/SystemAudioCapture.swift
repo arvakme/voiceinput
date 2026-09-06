@@ -29,18 +29,24 @@ final class SystemAudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unc
     private var pending = Data()
     /// 100 ms at 16 kHz mono 16-bit.
     private let chunkBytes = 3200
-    private var stopped = false
+    private var stopped = true
+    private var generation: UInt64 = 0
 
     func start() {
-        sampleQueue.sync {
+        let gen: UInt64? = sampleQueue.sync {
+            guard stopped else { return nil }
+            generation &+= 1
             stopped = false
             pending = Data()
+            return generation
         }
+        guard let gen else { return }
         Task { [weak self] in
             guard let self else { return }
             do {
                 // Triggers the Screen & System Audio Recording TCC prompt.
                 let content = try await SCShareableContent.current
+                guard self.isCurrent(gen) else { return }
                 guard let display = content.displays.first else {
                     throw CaptureError.message("No display available for audio capture")
                 }
@@ -61,17 +67,24 @@ final class SystemAudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unc
                 let stream = SCStream(filter: filter, configuration: config, delegate: self)
                 try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: self.sampleQueue)
                 try await stream.startCapture()
-                let abort = self.sampleQueue.sync { self.stopped }
-                if abort {
+                // Publish and check cancellation in one critical section.
+                // Otherwise stop() can observe nil between the check and
+                // assignment and leave an untracked stream recording.
+                let accepted = self.sampleQueue.sync {
+                    guard !self.stopped, self.generation == gen else { return false }
+                    self.stream = stream
+                    return true
+                }
+                guard accepted else {
                     try? await stream.stopCapture()
                     return
                 }
-                self.sampleQueue.sync { self.stream = stream }
                 Log.audio.info("SystemAudioCapture started")
             } catch {
                 Log.audio.error("SystemAudioCapture start failed: \(error.localizedDescription)")
                 DispatchQueue.main.async { [weak self] in
-                    self?.onError?("System audio capture failed: \(error.localizedDescription). Check System Settings → Privacy & Security → Screen & System Audio Recording.")
+                    guard let self, self.isCurrent(gen) else { return }
+                    self.onError?("System audio capture failed: \(error.localizedDescription). Check System Settings → Privacy & Security → Screen & System Audio Recording.")
                 }
             }
         }
@@ -80,6 +93,7 @@ final class SystemAudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unc
     func stop() {
         let active: SCStream? = sampleQueue.sync {
             stopped = true
+            generation &+= 1
             let s = stream
             stream = nil
             pending = Data()
@@ -93,11 +107,15 @@ final class SystemAudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unc
     // MARK: - SCStreamDelegate
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
-        let isStopped = sampleQueue.sync { stopped }
-        guard !isStopped else { return }
+        let gen: UInt64? = sampleQueue.sync {
+            guard !stopped, self.stream === stream else { return nil }
+            return generation
+        }
+        guard let gen else { return }
         Log.audio.error("SystemAudioCapture stream stopped: \(error.localizedDescription)")
         DispatchQueue.main.async { [weak self] in
-            self?.onError?("System audio stream stopped: \(error.localizedDescription)")
+            guard let self, self.isCurrent(gen) else { return }
+            self.onError?("System audio stream stopped: \(error.localizedDescription)")
         }
     }
 
@@ -106,7 +124,10 @@ final class SystemAudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unc
     func stream(_ stream: SCStream,
                 didOutputSampleBuffer sampleBuffer: CMSampleBuffer,
                 of type: SCStreamOutputType) {
-        guard type == .audio, sampleBuffer.isValid, !stopped else { return }
+        // A retired stream can still enqueue samples while stopCapture awaits.
+        // Only the registered stream may feed the current generation.
+        guard type == .audio, sampleBuffer.isValid, !stopped,
+              self.stream === stream else { return }
         guard let formatDesc = CMSampleBufferGetFormatDescription(sampleBuffer),
               let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(formatDesc)?.pointee
         else { return }
@@ -146,7 +167,11 @@ final class SystemAudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unc
         for sample in mono { sum += sample * sample }
         let rms = sqrtf(sum / Float(mono.count))
         let normalized = max(0, min(1, (20 * log10f(max(rms, 1e-6)) + 50) / 40))
-        DispatchQueue.main.async { [weak self] in self?.onLevel?(normalized) }
+        let gen = generation
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.isCurrent(gen) else { return }
+            self.onLevel?(normalized)
+        }
 
         // Decimate to 16 kHz (48 kHz / 3, averaging triples as a cheap low-pass)
         // and quantize to s16le.
@@ -168,6 +193,11 @@ final class SystemAudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unc
             pending.removeFirst(chunkBytes)
             onChunk?(Data(chunk))
         }
+    }
+
+    /// Called from main-thread callbacks, never from sampleQueue itself.
+    private func isCurrent(_ gen: UInt64) -> Bool {
+        sampleQueue.sync { !stopped && generation == gen }
     }
 
     private enum CaptureError: LocalizedError {
