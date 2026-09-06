@@ -125,6 +125,10 @@ struct ProvidersTab: View {
             TestButton(title: "Test connection", outcome: voiceOutcome) {
                 runVoiceTest()
             }
+            Text("Connection testing does not test microphone audio or transcription.")
+                .font(.caption).foregroundStyle(Theme.textSecondary)
+            Hairline()
+            MicrophoneTestView()
         }
     }
 
@@ -493,8 +497,7 @@ struct ProvidersTab: View {
     // MARK: Tests
 
     /// Streaming ASR has no request/response round trip the way Polish's
-    /// chat-completions call does, so this only proves the WebSocket handshake
-    /// and auth are accepted — see `ASRConnectionTester`.
+    /// chat-completions call does. This checks transport/config errors, not speech.
     private func runVoiceTest() {
         voiceOutcome = .running
         let completion: (Result<String, ASRConnectionTester.ConnectionError>) -> Void = { result in

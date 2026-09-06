@@ -58,6 +58,7 @@ final class DoubaoRealtimeSession: TranscriptionSession {
     private var latestText: String = ""
     private var reportedError = false
     private var isFinalized = false
+    private var audioBytesQueued = 0
     private var stopCompletion: ((String) -> Void)?
 
     // MARK: - Init
@@ -101,6 +102,7 @@ final class DoubaoRealtimeSession: TranscriptionSession {
 
             self.stopCompletion = completion
             self.isFinalized = true
+            Log.asr.info("Doubao audio bytes queued: \(self.audioBytesQueued)")
 
             // Empty payload, flagged as the last audio packet — tells the
             // server no more audio is coming so it emits a final response.
@@ -148,6 +150,7 @@ final class DoubaoRealtimeSession: TranscriptionSession {
             self.latestText = ""
             self.reportedError = false
             self.isFinalized = false
+            self.audioBytesQueued = 0
 
             task.resume()
             self.sendConfigFrameOnQueue()
@@ -297,9 +300,13 @@ final class DoubaoRealtimeSession: TranscriptionSession {
                 compression: .none
             )
             let frame = DoubaoWireFormat.frame(header: header, payload: data)
+            let firstChunk = self.audioBytesQueued == 0 && !data.isEmpty
+            self.audioBytesQueued += data.count
             task.send(.data(frame)) { error in
                 if let error {
                     Log.asr.error("DoubaoRealtimeSession: audio send error: \(error.localizedDescription)")
+                } else if firstChunk {
+                    Log.asr.info("Doubao first PCM send completed: \(data.count) bytes (not a transcription acknowledgement)")
                 }
             }
         }

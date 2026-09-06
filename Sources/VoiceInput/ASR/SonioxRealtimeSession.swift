@@ -70,6 +70,7 @@ final class SonioxRealtimeSession: TranscriptionSession {
     private var currentInterims: [String] = []    // fully replaced each message
     private var reportedError = false
     private var isFinalized = false
+    private var audioBytesQueued = 0
     private var stopCompletion: ((String) -> Void)?
     /// Reset only in `openWebSocket` (called once, from `start()`) — a session
     /// gets at most `maxReconnectAttempts` reconnects total, not per-outage.
@@ -131,6 +132,7 @@ final class SonioxRealtimeSession: TranscriptionSession {
 
             self.stopCompletion = completion
             self.isFinalized = true
+            Log.asr.info("Soniox audio bytes queued: \(self.audioBytesQueued)")
 
             // Send finalize control frame.
             self.sendTextOnQueue("{\"type\":\"finalize\"}")
@@ -177,6 +179,7 @@ final class SonioxRealtimeSession: TranscriptionSession {
             self.currentInterims = []
             self.reportedError = false
             self.isFinalized = false
+            self.audioBytesQueued = 0
             self.reconnectAttempts = 0
 
             task.resume()
@@ -437,9 +440,13 @@ final class SonioxRealtimeSession: TranscriptionSession {
                   self.isCurrentGen(gen),
                   !self.isFinalized,
                   let task = self.wsTask else { return }
+            let firstChunk = self.audioBytesQueued == 0
+            self.audioBytesQueued += data.count
             task.send(.data(data)) { error in
                 if let error = error {
                     Log.asr.error("SonioxRealtimeSession: audio send error: \(error.localizedDescription)")
+                } else if firstChunk {
+                    Log.asr.info("Soniox first PCM send completed: \(data.count) bytes (not a transcription acknowledgement)")
                 }
             }
         }
