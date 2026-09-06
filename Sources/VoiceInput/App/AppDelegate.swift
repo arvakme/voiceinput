@@ -14,6 +14,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let keyMonitor = KeyMonitor()
     private let textInjector = TextInjector()
     private let mediaController = MediaController()
+    private let externalStatus = ExternalStatusPublisher()
 
     private lazy var overlayPanel: OverlayPanel = {
         OverlayPanel(state: appState, settings: settings)
@@ -79,6 +80,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         observeSettings()
         observeCursorWorker()
         wireURLScheme()
+        appState.$phase.combineLatest(settings.$appEnabled)
+            .sink { [weak self] phase, enabled in self?.externalStatus.publish(phase: phase, enabled: enabled) }
+            .store(in: &cancellables)
 
         // Live Captions hotkey (Fn+Space toggle, Fn+Shift+Space layout).
         listenHotkey.onToggle = { [weak self] in
@@ -128,6 +132,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // to keep the process alive for the normal async resume, so quitting
         // mid-dictation could leave Spotify/Music paused forever otherwise.
         mediaController.resumeIfPausedAndWait(timeout: 2)
+        externalStatus.finish()
     }
 
     // MARK: - Preview overlay notification
