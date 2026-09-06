@@ -7,6 +7,29 @@ import Foundation
 ///
 /// macOS has no AVAudioSession — tap AVAudioEngine.inputNode directly.
 final class AudioCapture {
+    struct Diagnostics {
+        var inputFormat = "Not started"
+        var hardwareFrames = 0
+        var pcmFrames = 0
+        var peak: Int = 0
+        var conversionErrors = 0
+        var lastError: String?
+
+        var summary: String {
+            let result: String
+            if hardwareFrames == 0 { result = "No microphone samples received." }
+            else if pcmFrames == 0 { result = "Microphone samples received, but PCM conversion produced no audio." }
+            else if peak == 0 { result = "Audio received, but all converted samples are zero (silent)." }
+            else { result = "Nonzero microphone audio captured." }
+            return "\(result) Input: \(inputFormat). Input frames: \(hardwareFrames); PCM frames: \(pcmFrames); peak: \(peak)/32768; conversion errors: \(conversionErrors)." + (lastError.map { " \($0)" } ?? "")
+        }
+    }
+
+    var diagnostics: Diagnostics {
+        wavLock.lock(); defer { wavLock.unlock() }
+        return captureDiagnostics
+    }
+
     // MARK: - Public callbacks
 
     /// Called on a background thread with ~100 ms of 16 kHz mono PCM s16le audio.
@@ -53,9 +76,11 @@ final class AudioCapture {
 
     // MARK: - Private state
 
-    private let audioEngine = AVAudioEngine()
+    private var audioEngine = AVAudioEngine()
     private var converter: AVAudioConverter?
     private var isTapInstalled = false
+    private let processingLock = NSLock()
+    private var captureDiagnostics = Diagnostics()
 
     /// Accumulation buffer for 16 kHz s16le samples before emitting a chunk.
     private var sampleAccumulator = Data()
@@ -76,9 +101,16 @@ final class AudioCapture {
     /// - Throws: Any error thrown by `AVAudioEngine.start()`.
     func start() throws {
         stop()
+        // Re-read the current default input on every recording, rather than
+        // retaining an engine whose hardware configuration may have changed.
+        audioEngine = AVAudioEngine()
 
         let inputNode = audioEngine.inputNode
+        let inputFormat = inputNode.inputFormat(forBus: 0)
         let hwFormat = inputNode.outputFormat(forBus: 0)
+        guard Self.isValidInputFormat(inputFormat), Self.isValidInputFormat(hwFormat) else {
+            throw AudioCaptureError.invalidInputFormat
+        }
 
         guard let targetFormat = AVAudioFormat(
             commonFormat: .pcmFormatInt16,
@@ -99,7 +131,9 @@ final class AudioCapture {
         wavLock.lock()
         wavSamples = Data()
         wavCapReached = false
+        captureDiagnostics = Diagnostics(inputFormat: hwFormat.description)
         wavLock.unlock()
+        Log.audio.info("AudioCapture input=\(inputFormat.description, privacy: .public) tap=\(hwFormat.description, privacy: .public)")
 
         // Buffer size: ~100 ms worth of hardware-rate samples.
         let bufferSize = AVAudioFrameCount(max(512, hwFormat.sampleRate / 10))
@@ -110,11 +144,17 @@ final class AudioCapture {
         isTapInstalled = true
 
         audioEngine.prepare()
-        try audioEngine.start()
+        do {
+            try audioEngine.start()
+        } catch {
+            stop()
+            throw error
+        }
     }
 
     /// Stop audio capture and tear down the engine.
     func stop() {
+        let hadTap = isTapInstalled
         if audioEngine.isRunning {
             audioEngine.stop()
         }
@@ -122,6 +162,7 @@ final class AudioCapture {
             audioEngine.inputNode.removeTap(onBus: 0)
             isTapInstalled = false
         }
+        processingLock.lock(); defer { processingLock.unlock() }
         converter = nil
 
         // Flush the <100 ms remainder that never reached a full chunk boundary —
@@ -130,32 +171,81 @@ final class AudioCapture {
             onChunk?(sampleAccumulator)
             sampleAccumulator = Data()
         }
+        if hadTap {
+            Log.audio.info("AudioCapture stopped: \(self.diagnostics.summary, privacy: .public)")
+        }
     }
 
     // MARK: - Audio processing
 
     private func handleHardwareBuffer(_ buffer: AVAudioPCMBuffer) {
-        // ── Compute RMS level (formula from old-app) ────────────────────────
-        // Average power across every available channel so stereo/aggregate inputs
-        // don't read ~3 dB low from sampling channel 0 alone.
-        let frameCount = Int(buffer.frameLength)
-        let channelCount = Int(buffer.format.channelCount)
-        if frameCount > 0, channelCount > 0, let channelData = buffer.floatChannelData {
-            var sum: Float = 0
-            for ch in 0..<channelCount {
-                let samples = channelData[ch]
-                for i in 0..<frameCount { sum += samples[i] * samples[i] }
-            }
-            let rms = sqrtf(sum / Float(frameCount * channelCount))
-            let dB = 20.0 * log10(max(rms, 1e-6))
-            let normalized = max(0.0, min(1.0, (dB + 50.0) / 40.0))
-            DispatchQueue.main.async { [weak self] in
-                self?.onLevel?(normalized)
-            }
+        processingLock.lock(); defer { processingLock.unlock() }
+        guard let conv = converter else { return }
+        wavLock.lock()
+        captureDiagnostics.hardwareFrames += Int(buffer.frameLength)
+        wavLock.unlock()
+
+        let outBuf: AVAudioPCMBuffer
+        do {
+            guard let converted = try Self.convert(buffer, using: conv) else { return }
+            outBuf = converted
+        } catch {
+            let nsError = error as NSError
+            let message = "\(nsError.domain) (\(nsError.code)): \(nsError.localizedDescription)"
+            wavLock.lock()
+            captureDiagnostics.conversionErrors += 1
+            captureDiagnostics.lastError = message
+            let shouldLog = captureDiagnostics.conversionErrors == 1
+            wavLock.unlock()
+            if shouldLog { Log.audio.error("AudioCapture conversion failed: \(message, privacy: .public)") }
+            return
         }
 
-        // ── Resample to 16 kHz Int16 mono ───────────────────────────────────
-        guard let conv = converter else { return }
+        let frameLen = Int(outBuf.frameLength)
+        guard let int16Data = outBuf.int16ChannelData?[0] else { return }
+        var sum: Double = 0
+        var peak = 0
+        for i in 0..<frameLen {
+            let sample = Int(int16Data[i])
+            peak = max(peak, abs(sample))
+            let scaled = Double(sample) / 32768
+            sum += scaled * scaled
+        }
+        let rms = sqrt(sum / Double(frameLen))
+        let normalized = Float(max(0, min(1, (20 * log10(max(rms, 1e-6)) + 50) / 40)))
+        DispatchQueue.main.async { [weak self] in self?.onLevel?(normalized) }
+        let rawBytes = Data(bytes: int16Data, count: frameLen * MemoryLayout<Int16>.size)
+
+        wavLock.lock()
+        captureDiagnostics.pcmFrames += frameLen
+        captureDiagnostics.peak = max(captureDiagnostics.peak, peak)
+        let remaining = max(0, AudioCapture.maxWAVSampleBytes - wavSamples.count)
+        wavSamples.append(rawBytes.prefix(remaining))
+        if rawBytes.count > remaining, !wavCapReached {
+            wavCapReached = true
+            Log.audio.warning("AudioCapture: WAV accumulation hit 10-minute cap; further audio dropped from history")
+        }
+        wavLock.unlock()
+
+        sampleAccumulator.append(rawBytes)
+        let chunkBytes = AudioCapture.chunkSamples * MemoryLayout<Int16>.size
+        while sampleAccumulator.count >= chunkBytes {
+            let chunk = sampleAccumulator.prefix(chunkBytes)
+            sampleAccumulator.removeFirst(chunkBytes)
+            onChunk?(chunk)
+        }
+    }
+
+    static func isValidInputFormat(_ format: AVAudioFormat) -> Bool {
+        format.sampleRate.isFinite && format.sampleRate > 0 && format.channelCount > 0
+    }
+
+    /// The production conversion path is independently testable without opening a microphone.
+    static func convert(_ buffer: AVAudioPCMBuffer, using conv: AVAudioConverter) throws -> AVAudioPCMBuffer? {
+        guard isValidInputFormat(buffer.format), buffer.format == conv.inputFormat else {
+            throw AudioCaptureError.invalidInputFormat
+        }
+        guard buffer.frameLength > 0 else { return nil }
         let hwSampleRate = buffer.format.sampleRate
         let outputFrameCapacity = AVAudioFrameCount(
             ceil(Double(buffer.frameLength) * AudioCapture.targetSampleRate / hwSampleRate) + 16
@@ -164,7 +254,7 @@ final class AudioCapture {
               let outBuf = AVAudioPCMBuffer(
                 pcmFormat: conv.outputFormat,
                 frameCapacity: outputFrameCapacity
-              ) else { return }
+              ) else { throw AudioCaptureError.formatCreationFailed }
 
         var consumedAll = false
         let inputBlock: AVAudioConverterInputBlock = { _, outStatus in
@@ -179,43 +269,9 @@ final class AudioCapture {
 
         var convError: NSError?
         let status = conv.convert(to: outBuf, error: &convError, withInputFrom: inputBlock)
-        guard status != .error, outBuf.frameLength > 0 else { return }
-
-        // outBuf is Int16 interleaved mono; extract raw bytes.
-        let frameLen = Int(outBuf.frameLength)
-        guard let int16Data = outBuf.int16ChannelData?[0] else { return }
-        let rawBytes = Data(
-            bytes: int16Data,
-            count: frameLen * MemoryLayout<Int16>.size
-        )
-
-        // ── Append to running WAV (bounded at ~10 min) ───────────────────────
-        wavLock.lock()
-        if wavSamples.count < AudioCapture.maxWAVSampleBytes {
-            let remaining = AudioCapture.maxWAVSampleBytes - wavSamples.count
-            if rawBytes.count <= remaining {
-                wavSamples.append(rawBytes)
-            } else {
-                wavSamples.append(rawBytes.prefix(remaining))
-                if !wavCapReached {
-                    wavCapReached = true
-                    Log.audio.warning("AudioCapture: WAV accumulation hit 10-minute cap; further audio dropped from history")
-                }
-            }
-        } else if !wavCapReached {
-            wavCapReached = true
-            Log.audio.warning("AudioCapture: WAV accumulation hit 10-minute cap; further audio dropped from history")
-        }
-        wavLock.unlock()
-
-        // ── Accumulate → emit ~100 ms chunks ────────────────────────────────
-        sampleAccumulator.append(rawBytes)
-        let chunkBytes = AudioCapture.chunkSamples * MemoryLayout<Int16>.size
-        while sampleAccumulator.count >= chunkBytes {
-            let chunk = sampleAccumulator.prefix(chunkBytes)
-            sampleAccumulator.removeFirst(chunkBytes)
-            onChunk?(chunk)
-        }
+        if let convError { throw convError }
+        guard status != .error else { throw AudioCaptureError.conversionFailed }
+        return outBuf.frameLength > 0 ? outBuf : nil
     }
 
     // MARK: - WAV helpers
@@ -258,11 +314,15 @@ final class AudioCapture {
 // MARK: - Error types
 
 enum AudioCaptureError: Error, LocalizedError {
+    case invalidInputFormat
+    case conversionFailed
     case formatCreationFailed
     case converterCreationFailed
 
     var errorDescription: String? {
         switch self {
+        case .invalidInputFormat: return "Microphone format is unavailable or changed. Check the macOS sound input and start recording again."
+        case .conversionFailed: return "Microphone audio could not be converted to 16 kHz PCM."
         case .formatCreationFailed:   return "AudioCapture: failed to create 16 kHz mono Int16 format"
         case .converterCreationFailed: return "AudioCapture: failed to create AVAudioConverter"
         }

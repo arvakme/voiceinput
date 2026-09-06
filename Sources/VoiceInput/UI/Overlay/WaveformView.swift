@@ -37,8 +37,8 @@ private final class WaveformHistory {
 ///
 /// Newest sample on the right, oldest on the left. Bars are symmetric about the
 /// vertical centerline, drawn with rounded caps in an accent gradient. When the
-/// incoming level sits near zero the view "breathes": a slow, gentle sinusoidal
-/// ripple so the box never looks frozen between words.
+/// incoming level is zero the bars stay flat, so animation never implies that
+/// microphone samples are arriving when they are not.
 struct WaveformView: View {
     @ObservedObject var state: AppState
 
@@ -110,18 +110,12 @@ struct WaveformView: View {
         }
 
         let samples = history.samples
-        let smoothed = history.smoothedLevel
 
         let centerY = size.height / 2
         let totalWidth = CGFloat(barCount) * barWidth + CGFloat(barCount - 1) * barGap
         let startX = (size.width - totalWidth) / 2
         let maxHeight = size.height * 0.92
         let minHeight: CGFloat = 2.5
-
-        // Idle breathing: a slow travelling sine so a silent box still feels
-        // alive. Only meaningfully contributes when the live signal is quiet.
-        let breathPhase = now * 1.6
-        let idleness = max(0, 1 - smoothed * 6) // 1 when silent, →0 with speech
 
         let accent = Theme.accent
 
@@ -140,14 +134,10 @@ struct WaveformView: View {
 
             let positional = Double(i) / Double(barCount - 1)
 
-            // Per-bar idle ripple: phase offset along the row so it travels.
-            let breathe = sin(breathPhase - positional * 5.0) * 0.5 + 0.5
-            let idleContribution = idleness * breathe * 0.12
-
             // A subtle envelope so the very ends of the row taper.
             let edge = edgeEnvelope(positional)
 
-            let level = min(1, max(0, s + CGFloat(idleContribution))) * edge
+            let level = min(1, max(0, s)) * edge
             let h = minHeight + (maxHeight - minHeight) * level
 
             let x = startX + CGFloat(i) * (barWidth + barGap)
