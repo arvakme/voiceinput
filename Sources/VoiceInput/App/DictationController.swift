@@ -641,34 +641,27 @@ final class DictationController {
             return
         }
 
-        let needsRefine = settings.polishEnabled || settings.translateEnabled
+        // Refine always runs now: the selected Polish preset (Daily, Coding,
+        // …) IS the "should this be processed and how" decision — there is
+        // no longer a separate on/off switch layered on top of it.
+        appState.phase = .refining
+        pendingBestTranscript = trimmed
 
-        if needsRefine {
-            appState.phase = .refining
-            pendingBestTranscript = trimmed
-
-            refiner.refine(trimmed, preset: sessionPolishPreset) { [weak self] refined in
-                guard let self else { return }
-                guard self.sessionGeneration == generation else { return }
-                self.pendingBestTranscript = nil
-                // refiner completion is on main thread.
-                let refinedTrimmed = refined.trimmingCharacters(in: .whitespacesAndNewlines)
-                let finalText = refinedTrimmed.isEmpty ? trimmed : refined
-                // `refined` for history: the post-refiner text only when
-                // refinement actually changed the raw transcript, else nil.
-                let recordedRefined: String? = (finalText != trimmed) ? finalText : nil
-                self.injectAndFinish(text: finalText,
-                                     raw: trimmed,
-                                     refined: recordedRefined,
-                                     generation: generation,
-                                     externallyEnded: externallyEnded)
-            }
-        } else {
-            injectAndFinish(text: trimmed,
-                            raw: trimmed,
-                            refined: nil,
-                            generation: generation,
-                            externallyEnded: externallyEnded)
+        refiner.refine(trimmed, preset: sessionPolishPreset) { [weak self] refined in
+            guard let self else { return }
+            guard self.sessionGeneration == generation else { return }
+            self.pendingBestTranscript = nil
+            // refiner completion is on main thread.
+            let refinedTrimmed = refined.trimmingCharacters(in: .whitespacesAndNewlines)
+            let finalText = refinedTrimmed.isEmpty ? trimmed : refined
+            // `refined` for history: the post-refiner text only when
+            // refinement actually changed the raw transcript, else nil.
+            let recordedRefined: String? = (finalText != trimmed) ? finalText : nil
+            self.injectAndFinish(text: finalText,
+                                 raw: trimmed,
+                                 refined: recordedRefined,
+                                 generation: generation,
+                                 externallyEnded: externallyEnded)
         }
     }
 

@@ -86,7 +86,6 @@ struct GlassVoiceBox: View {
         // wrong canvas for the duration of the morph.
         .animation(.spring(duration: 0.35), value: state.phase)
         .animation(.spring(duration: 0.35), value: state.silenceCountdown != nil)
-        .animation(.spring(duration: 0.35), value: settings.polishEnabled)
         .animation(.spring(duration: 0.35), value: settings.translateEnabled)
     }
 
@@ -508,11 +507,6 @@ struct GlassVoiceBox: View {
                     }
                 }
             }
-
-            Button { settings.polishEnabled.toggle() } label: {
-                FeatureChip(title: "Polish", active: settings.polishEnabled)
-            }
-            .buttonStyle(.plain)
 
             Button { settings.translateEnabled.toggle() } label: {
                 FeatureChip(

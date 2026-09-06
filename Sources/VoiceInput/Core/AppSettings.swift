@@ -142,7 +142,6 @@ final class AppSettings: ObservableObject {
         static let sonioxModel                  = "sonioxModel"
         static let doubaoAPIKey                  = "doubaoAPIKey"
         static let doubaoResourceId              = "doubaoResourceId"
-        static let polishEnabled                = "polishEnabled"
         static let polishBaseURL                = "polishBaseURL"
         static let polishAPIKey                 = "polishAPIKey"
         static let polishModel                  = "polishModel"
@@ -227,7 +226,6 @@ final class AppSettings: ObservableObject {
         if d.string(forKey: Key.sonioxModel) == "stt-rt-v4"   { d.set("stt-rt-v5", forKey: Key.sonioxModel) }
         if d.object(forKey: Key.doubaoAPIKey) == nil          { d.set("", forKey: Key.doubaoAPIKey) }
         if d.object(forKey: Key.doubaoResourceId) == nil      { d.set("volc.seedasr.sauc.duration", forKey: Key.doubaoResourceId) }
-        if d.object(forKey: Key.polishEnabled) == nil         { d.set(true, forKey: Key.polishEnabled) }
         if d.object(forKey: Key.polishBaseURL) == nil         { d.set("https://openrouter.ai/api/v1", forKey: Key.polishBaseURL) }
         if d.object(forKey: Key.polishAPIKey) == nil          { d.set("", forKey: Key.polishAPIKey) }
         if d.object(forKey: Key.polishModel) == nil           { d.set("openai/gpt-oss-120b:free", forKey: Key.polishModel) }
@@ -396,10 +394,6 @@ final class AppSettings: ObservableObject {
     }
 
     // MARK: - Refinement
-
-    @Published var polishEnabled: Bool = UserDefaults.standard.bool(forKey: Key.polishEnabled) {
-        didSet { defaults.set(polishEnabled, forKey: Key.polishEnabled) }
-    }
 
     @Published var polishBaseURL: String = {
         let v = UserDefaults.standard.string(forKey: Key.polishBaseURL) ?? "https://openrouter.ai/api/v1"

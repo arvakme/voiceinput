@@ -9,6 +9,7 @@ struct HotkeyTab: View {
 
     @State private var timingExpanded = false
     @State private var isRecordingShortcut = false
+    @State private var recorderProxy = ShortcutRecorderProxy()
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -40,30 +41,36 @@ struct HotkeyTab: View {
                     help: "Click the field, then press the key combination you want (needs at least one modifier)."
                 ) {
                     ZStack(alignment: .leading) {
-                        // Visual only — sits UNDERNEATH the recorder button,
-                        // never in the hit-test path.
-                        KeycapRowView(
-                            shortcut: HotkeyShortcut(
-                                keyCode: UInt16(max(0, min(settings.customHotkeyKeyCode, Int(UInt16.max)))),
-                                modifierFlags: NSEvent.ModifierFlags(rawValue: UInt(max(0, settings.customHotkeyModifierFlags))),
-                                keyEquivalent: settings.customHotkeyKeyEquivalent
-                            ),
-                            isRecording: isRecordingShortcut
-                        )
-
-                        // The real click/key-capture target. Must be the
-                        // TOPMOST view in this ZStack — an AppKit button
-                        // under a SwiftUI overlay does not reliably receive
-                        // clicks even with allowsHitTesting(false) on the
-                        // view above it, only when it's on top itself.
+                        // Zero-size — exists only to host the NSEvent
+                        // capture (becoming first responder doesn't need a
+                        // visible frame). The click target below is a plain
+                        // SwiftUI Button instead of an overlaid AppKit
+                        // button, so its hit area is guaranteed to match
+                        // exactly what's drawn: no risk of the two
+                        // disagreeing the way an invisible NSButton sized
+                        // independently of its SwiftUI overlay can.
                         ShortcutRecorder(
                             keyCode: $settings.customHotkeyKeyCode,
                             modifierFlags: $settings.customHotkeyModifierFlags,
                             keyEquivalent: $settings.customHotkeyKeyEquivalent,
-                            isRecording: $isRecordingShortcut
+                            isRecording: $isRecordingShortcut,
+                            proxy: recorderProxy
                         )
-                        .frame(height: 30)
-                        .opacity(0.011)
+                        .frame(width: 0, height: 0)
+
+                        Button {
+                            recorderProxy.beginRecording()
+                        } label: {
+                            KeycapRowView(
+                                shortcut: HotkeyShortcut(
+                                    keyCode: UInt16(max(0, min(settings.customHotkeyKeyCode, Int(UInt16.max)))),
+                                    modifierFlags: NSEvent.ModifierFlags(rawValue: UInt(max(0, settings.customHotkeyModifierFlags))),
+                                    keyEquivalent: settings.customHotkeyKeyEquivalent
+                                ),
+                                isRecording: isRecordingShortcut
+                            )
+                        }
+                        .buttonStyle(.plain)
                     }
                     .frame(maxWidth: 280, alignment: .leading)
                 }
@@ -191,16 +198,29 @@ struct HotkeyTab: View {
 
 // MARK: - Shortcut recorder (ported from old app's ShortcutRecorderNSButton)
 
-/// SwiftUI wrapper around an AppKit button that records a key combination.
+/// Lets the SwiftUI `Button` that's the actual click target reach the
+/// AppKit capture view without SwiftUI's `NSViewRepresentable.Coordinator`
+/// (private to the representable's own lifecycle) getting in the way.
+final class ShortcutRecorderProxy {
+    fileprivate weak var button: ShortcutRecorderButton?
+    func beginRecording() { button?.beginRecording() }
+}
+
+/// SwiftUI wrapper around an AppKit view that records a key combination.
+/// Zero-sized in practice (see `HotkeyTab.keyCard`) — recording starts via
+/// `proxy.beginRecording()` from a normal SwiftUI button, not a click on
+/// this view itself.
 private struct ShortcutRecorder: NSViewRepresentable {
     @Binding var keyCode: Int
     @Binding var modifierFlags: Int
     @Binding var keyEquivalent: String
     @Binding var isRecording: Bool
+    let proxy: ShortcutRecorderProxy
 
     func makeNSView(context: Context) -> ShortcutRecorderButton {
         let button = ShortcutRecorderButton(frame: .zero)
         button.isBordered = false
+        proxy.button = button
         configure(button)
         return button
     }
@@ -265,7 +285,7 @@ private final class ShortcutRecorderButton: NSButton {
 
     override var acceptsFirstResponder: Bool { true }
 
-    @objc private func beginRecording() {
+    @objc func beginRecording() {
         guard !isRecording else { return }
         isRecording = true
         onRecordingChange?(true)

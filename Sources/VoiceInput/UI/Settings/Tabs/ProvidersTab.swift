@@ -134,16 +134,9 @@ struct ProvidersTab: View {
         Card {
             CardHeading(
                 title: "Polish · OpenRouter",
-                subtitle: "Cleans disfluencies, fillers, and punctuation while preserving meaning and language."
+                subtitle: "Every dictation runs through the preset below — from Daily's light cleanup to Coding's full rewrite. Add a preset of your own for anything in between."
             )
             presetRow
-            Hairline()
-            InlineRow(
-                title: "Enable polish",
-                help: "Run a cleanup pass on every transcript."
-            ) {
-                BlueToggle(isOn: $settings.polishEnabled)
-            }
             Hairline()
             FieldRow(
                 title: "Base URL",

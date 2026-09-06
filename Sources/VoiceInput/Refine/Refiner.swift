@@ -53,9 +53,11 @@ final class Refiner {
 
     // MARK: - Public API
 
-    /// Runs polish (if enabled) then translate (if enabled) sequentially.
-    /// Completion always fires on main thread with the best available text.
-    /// Never throws to caller; any step failure is logged and skipped.
+    /// Runs polish (always — the preset itself decides what that means, from
+    /// a light Daily cleanup to a full Coding rewrite) then translate (if
+    /// enabled) sequentially. Completion always fires on main thread with
+    /// the best available text. Never throws to caller; any step failure is
+    /// logged and skipped.
     ///
     /// - Parameter preset: The Polish preset this dictation should use,
     ///   normally captured by the caller at session start (see
@@ -69,8 +71,7 @@ final class Refiner {
         lastPolishFailureReason = nil
         activePreset = preset ?? presets.selected
 
-        var steps: [Step] = []
-        if settings.polishEnabled    { steps.append(.polish) }
+        var steps: [Step] = [.polish]
         if settings.translateEnabled { steps.append(.translate) }
 
         guard !steps.isEmpty else {
